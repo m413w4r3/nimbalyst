@@ -10,6 +10,7 @@ import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 import { buildCodexThreadStartParams } from '../../protocols/codexAppServer/threadConfiguration';
+import { parseCodexConfigModels } from '../codex/codexConfigModels';
 
 // getModels() cross-checks the OpenAI model catalogue whenever it is given an
 // API key. Unmocked, that is a real api.openai.com request from the unit suite:
@@ -2061,19 +2062,76 @@ describe('OpenAICodexProvider', () => {
       expect(createSession).toHaveBeenCalledTimes(1);
     });
 
-    it('sends a custom-provider model to the app-server thread unchanged', async () => {
-      OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
+    describe('model_provider pinning', () => {
+      const secret = 'sk-deepseek-SECRET';
+      const deepseekConfig = [
+        'model = "deepseek-flash"',
+        'model_provider = "deepseek"',
+        '[model_providers.deepseek]',
+        'base_url = "https://api.deepseek.com/v1"',
+        'env_key = "DEEPSEEK_API_KEY"',
+        `experimental_bearer_token = "${secret}"`,
+        '[profiles.deepseek-v4-pro]',
+        'model = "deepseek-v4-pro"',
+        'model_provider = "deepseek"',
+        `api_key = "${secret}"`,
+        '[profiles.local]',
+        'model = "my-local-model"',
+        'model_provider = "local-llm"',
+      ].join('\n');
 
-      const { provider, createSession } = buildAppServerProvider();
-      await provider.initialize({ model: 'openai-codex:deepseek-flash' });
-      for await (const _chunk of provider.sendMessage('hi', undefined, 'session-custom-model', [], process.cwd())) {
-        // drain
+      async function threadParamsFor(model: string, toml: string | null) {
+        OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
+        const createSession = vi.fn(async () => ({ id: 'thread-provider', platform: 'codex-app-server', raw: {} }));
+        const provider = new OpenAICodexProvider({}, {
+          transport: 'app-server',
+          readCodexConfig: async () => toml,
+          protocol: {
+            platform: 'codex-app-server',
+            createSession,
+            resumeSession: vi.fn(),
+            forkSession: vi.fn(),
+            sendMessage: vi.fn(() => createAsyncEventStream([])),
+            abortSession: vi.fn(),
+            cleanupSession: vi.fn(),
+          } as any,
+        });
+        await provider.initialize({ model: `openai-codex:${model}` });
+        for await (const _chunk of provider.sendMessage('hi', undefined, `session-${model}`, [], process.cwd())) {
+          // drain
+        }
+        return buildCodexThreadStartParams((createSession.mock.calls[0] as any[])[0]);
       }
 
-      const threadParams = buildCodexThreadStartParams((createSession.mock.calls[0] as any[])[0]);
-      expect(threadParams.model).toBe('deepseek-flash');
-      // model_provider must come from the user's config.toml, never an override.
-      expect(threadParams.config).not.toHaveProperty('model_provider');
+      it.each([
+        ['deepseek-flash', 'deepseek'],
+        ['deepseek-v4-pro', 'deepseek'],
+        ['my-local-model', 'local-llm'],
+        ['gpt-6-luna', 'openai'],
+        ['gpt-6-sol', 'openai'],
+      ])('starts %s with model_provider=%s despite a global deepseek provider', async (model, expected) => {
+        const params = await threadParamsFor(model, deepseekConfig);
+        expect(params.model).toBe(model);
+        expect(params.modelProvider).toBe(expected);
+      });
+
+      it('leaves the provider to Codex when config.toml configures none', async () => {
+        expect((await threadParamsFor('gpt-6-sol', null)).modelProvider).toBeUndefined();
+        expect((await threadParamsFor('gpt-6-sol', 'model = "gpt-6-sol"\n')).modelProvider).toBeUndefined();
+      });
+
+      it('parses only model/provider pairs, never credentials', () => {
+        const models = parseCodexConfigModels(deepseekConfig);
+        expect(models).toEqual([
+          { model: 'deepseek-flash', provider: 'deepseek' },
+          { model: 'deepseek-v4-pro', provider: 'deepseek' },
+          { model: 'my-local-model', provider: 'local-llm' },
+        ]);
+        expect(JSON.stringify(models)).not.toContain(secret);
+        // A profile without its own model_provider inherits the top-level one, as in Codex.
+        expect(parseCodexConfigModels('model_provider = "deepseek"\n[profiles.x]\nmodel = "deepseek-chat"\n'))
+          .toEqual([{ model: 'deepseek-chat', provider: 'deepseek' }]);
+      });
     });
 
     it('requires sign-in only when no account is loaded and the model provider needs OpenAI auth', () => {

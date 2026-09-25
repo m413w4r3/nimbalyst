@@ -35,8 +35,13 @@ export function buildCodexThreadStartParams(options: SessionOptions): ThreadStar
     model_reasoning_effort: reasoningEffortRaw,
   };
 
+  // Pin the provider the host resolved for this model so it never inherits an
+  // unrelated global `model_provider` from config.toml.
+  const modelProvider = options.raw?.codexModelProvider as string | undefined;
+
   return {
     model: options.model ?? null,
+    ...(modelProvider ? { modelProvider } : {}),
     sandbox: permissionProfile.sandboxMode,
     cwd: options.workspacePath,
     approvalPolicy: permissionProfile.approvalPolicy,

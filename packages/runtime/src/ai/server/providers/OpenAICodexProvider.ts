@@ -29,7 +29,7 @@ import { capAppServerItemParamsForStorage } from '../../../storage/toolOutputBud
 import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
-import { parseCodexConfigModelIds, readCodexConfigToml } from './codex/codexConfigModels';
+import { parseCodexConfigModelIds, readCodexConfigToml, resolveCodexModelProvider } from './codex/codexConfigModels';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
 import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
@@ -80,6 +80,8 @@ interface OpenAICodexProviderDeps {
   idleProtocolSessionTimeoutMs?: number;
   /** Injectable scheduler keeps lifecycle tests deterministic without global fake timers. */
   idleProtocolSessionScheduler?: ProtocolSessionIdleScheduler;
+  /** Codex config.toml reader; defaults to the user's real file. */
+  readCodexConfig?: () => Promise<string | null>;
 }
 
 interface OpenAICodexModelDiscoveryDeps {
@@ -174,6 +176,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   private readonly protocol: CodexProtocol;
   private readonly transport: CodexTransport;
+  private readonly readCodexConfig?: () => Promise<string | null>;
   private readonly permissionService: ToolPermissionService;
   private readonly mcpConfigService: McpConfigService;
   private readonly pendingAskUserQuestions = new Map<string, PendingAskUserQuestionEntry>();
@@ -357,6 +360,8 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       setTimeout: (callback, timeoutMs) => setTimeout(callback, timeoutMs),
       clearTimeout: (handle) => clearTimeout(handle),
     };
+
+    this.readCodexConfig = deps?.readCodexConfig;
 
     // Resolve transport: explicit dep > registered resolver > SDK-specific test
     // deps > default 'app-server'.
@@ -1174,6 +1179,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       }
 
       const resolvedModel = await this.getConfiguredModel();
+      const codexModelProvider = resolveCodexModelProvider(
+        await (this.readCodexConfig ?? readCodexConfigToml)(),
+        resolvedModel,
+      );
 
       const sessionOptions = {
         workspacePath,
@@ -1190,6 +1199,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           abortSignal: abortController.signal,
           agentVerified: permissionDecision.agentVerified === true,
           codexConfigOverrides: this.buildCodexConfigOverrides(mcpServers),
+          ...(codexModelProvider ? { codexModelProvider } : {}),
           ...(codexEnv ? { codexEnv } : {}),
           ...(this.config?.effortLevel ? { effortLevel: this.config.effortLevel } : {}),
           ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
