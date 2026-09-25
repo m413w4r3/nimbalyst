@@ -361,6 +361,14 @@ export interface AIModel {
    * so a revoked credential never silently erases a selection (#916).
    */
   unavailable?: boolean;
+  /**
+   * Exact effort levels the model's own catalog declares (a Codex
+   * `model_catalog_json` entry). When set, the effort selector offers exactly
+   * these instead of the static per-model ceiling.
+   */
+  supportedEffortLevels?: EffortLevel[];
+  /** The catalog's default effort for the model, when it declares one. */
+  defaultEffortLevel?: EffortLevel;
 }
 
 export interface AIModelCost {

@@ -1,8 +1,10 @@
 import React, { useEffect } from 'react';
+import { useAtomValue } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import type { EffortLevel } from '../../utils/modelUtils';
 import { EFFORT_LEVELS, DEFAULT_EFFORT_LEVEL, clampEffortLevel, getAvailableEffortLevels } from '../../utils/modelUtils';
 import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
+import { modelEffortLevelsAtom } from '../../store/atoms/modelEffortLevels';
 
 interface EffortLevelSelectorProps {
   open?: boolean;
@@ -14,7 +16,8 @@ interface EffortLevelSelectorProps {
   /**
    * Model the effort applies to. Levels above the model's ceiling are hidden,
    * so the menu never offers a level the provider would reject (only Codex
-   * Astra/Sol/Terra reach Ultra; gpt-5.4/5.5 stop at xHigh).
+   * Astra/Sol/Terra reach Ultra; gpt-5.4/5.5 stop at xHigh). A model whose
+   * catalog declares exact levels (custom Codex models) offers only those.
    */
   modelId?: string;
 }
@@ -31,8 +34,9 @@ export function EffortLevelSelector({ open, onOpenChange, level, onLevelChange, 
 
   // Show what will actually run: a session carrying a level the current model
   // cannot accept displays its clamped value rather than the stored one.
-  const availableLevels = getAvailableEffortLevels(modelId);
-  const effectiveLevel = clampEffortLevel(level, modelId);
+  const supportedLevels = useAtomValue(modelEffortLevelsAtom)[modelId ?? ''];
+  const availableLevels = getAvailableEffortLevels(modelId, supportedLevels);
+  const effectiveLevel = clampEffortLevel(level, modelId, supportedLevels);
   const currentLevel = availableLevels.find((l) => l.key === effectiveLevel) ?? EFFORT_LEVELS.find((l) => l.key === DEFAULT_EFFORT_LEVEL)!;
 
   const setMenuRef = React.useCallback((node: HTMLDivElement | null) => {

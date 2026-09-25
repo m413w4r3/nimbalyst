@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { isEffortLevel, type EffortLevel } from '../../effortLevels';
 
 /** Codex's built-in provider id for OpenAI's own models. */
 export const CODEX_OPENAI_MODEL_PROVIDER = 'openai';
@@ -82,12 +83,118 @@ export function resolveCodexModelProvider(toml: string | null, model: string): s
   return configuresProvider ? CODEX_OPENAI_MODEL_PROVIDER : undefined;
 }
 
+/** Codex's home directory, honoring `CODEX_HOME` the way the Codex CLI does. */
+export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
+  return env.CODEX_HOME?.trim() || path.join(os.homedir(), '.codex');
+}
+
 /** Codex's config.toml, honoring `CODEX_HOME` the way the Codex CLI does. */
 export async function readCodexConfigToml(): Promise<string | null> {
-  const codexHome = process.env.CODEX_HOME?.trim() || path.join(os.homedir(), '.codex');
   try {
-    return await fs.readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    return await fs.readFile(path.join(resolveCodexHome(), 'config.toml'), 'utf8');
   } catch {
     return null;
+  }
+}
+
+/** Effort capabilities a custom model catalog declares for one model. */
+export interface CodexModelEffortInfo {
+  supportedEffortLevels: EffortLevel[];
+  defaultEffortLevel?: EffortLevel;
+}
+
+/** Catalog effort capabilities keyed by model slug. */
+export type CodexModelCatalog = Map<string, CodexModelEffortInfo>;
+
+/**
+ * Absolute path of the top-level `model_catalog_json` config.toml points at,
+ * or null when it sets none. `~` expands to the home directory and a relative
+ * path resolves against the Codex home, where config.toml lives.
+ */
+export function resolveCodexModelCatalogPath(
+  toml: string,
+  codexHome: string,
+  homeDir: string = os.homedir(),
+): string | null {
+  let value: string | undefined;
+  for (const line of toml.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      break; // only the top-level key counts, as in Codex
+    }
+    const match = /^\s*model_catalog_json\s*=\s*(?:"((?:[^"\\]|\\.)+)"|'([^']+)')/.exec(line);
+    if (match) {
+      value = match[1] !== undefined ? match[1].replace(/\\(["\\])/g, '$1') : match[2];
+    }
+  }
+  value = value?.trim();
+  if (!value) {
+    return null;
+  }
+  if (value === '~' || value.startsWith('~/') || value.startsWith('~\\')) {
+    value = path.join(homeDir, value.slice(1));
+  }
+  return path.resolve(codexHome, value);
+}
+
+/**
+ * Parse a Codex model catalog (`{ models: [...] }`) down to each model's
+ * declared effort levels. Only `slug`, `supported_reasoning_levels[].effort`
+ * and `default_reasoning_level` are read; levels Nimbalyst has no name for are
+ * dropped, and a model left with no known level gets no entry so it keeps the
+ * static fallback. Malformed input yields an empty catalog.
+ */
+export function parseCodexModelCatalog(json: string): CodexModelCatalog {
+  const catalog: CodexModelCatalog = new Map();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return catalog;
+  }
+  const models = (parsed as { models?: unknown } | null)?.models;
+  if (!Array.isArray(models)) {
+    return catalog;
+  }
+  for (const entry of models) {
+    const slug = (entry as { slug?: unknown } | null)?.slug;
+    const levels = (entry as { supported_reasoning_levels?: unknown }).supported_reasoning_levels;
+    if (typeof slug !== 'string' || !slug.trim() || !Array.isArray(levels)) {
+      continue;
+    }
+    const supportedEffortLevels: EffortLevel[] = [];
+    for (const level of levels) {
+      const effort = (level as { effort?: unknown } | null)?.effort;
+      if (isEffortLevel(effort) && !supportedEffortLevels.includes(effort)) {
+        supportedEffortLevels.push(effort);
+      }
+    }
+    if (supportedEffortLevels.length === 0) {
+      continue;
+    }
+    const declaredDefault = (entry as { default_reasoning_level?: unknown }).default_reasoning_level;
+    catalog.set(slug.trim(), {
+      supportedEffortLevels,
+      ...(isEffortLevel(declaredDefault) && supportedEffortLevels.includes(declaredDefault)
+        ? { defaultEffortLevel: declaredDefault }
+        : {}),
+    });
+  }
+  return catalog;
+}
+
+/**
+ * Effort capabilities from the model catalog config.toml's `model_catalog_json`
+ * names -- the same file Codex's `model/list` serves custom models from. Empty
+ * when no catalog is configured or it cannot be read.
+ */
+export async function readCodexModelCatalog(toml: string | null): Promise<CodexModelCatalog> {
+  const catalogPath = toml ? resolveCodexModelCatalogPath(toml, resolveCodexHome()) : null;
+  if (!catalogPath) {
+    return new Map();
+  }
+  try {
+    return parseCodexModelCatalog(await fs.readFile(catalogPath, 'utf8'));
+  } catch {
+    return new Map();
   }
 }

@@ -29,7 +29,13 @@ import { capAppServerItemParamsForStorage } from '../../../storage/toolOutputBud
 import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
-import { parseCodexConfigModelIds, readCodexConfigToml, resolveCodexModelProvider } from './codex/codexConfigModels';
+import {
+  parseCodexConfigModelIds,
+  readCodexConfigToml,
+  readCodexModelCatalog,
+  resolveCodexModelProvider,
+  type CodexModelCatalog,
+} from './codex/codexConfigModels';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
 import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
@@ -82,11 +88,14 @@ interface OpenAICodexProviderDeps {
   idleProtocolSessionScheduler?: ProtocolSessionIdleScheduler;
   /** Codex config.toml reader; defaults to the user's real file. */
   readCodexConfig?: () => Promise<string | null>;
+  /** Reader for the `model_catalog_json` config.toml names; defaults to the real file. */
+  readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
 }
 
 interface OpenAICodexModelDiscoveryDeps {
   loadSdkModule?: () => Promise<CodexSdkModuleLike>;
   readCodexConfig?: () => Promise<string | null>;
+  readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
 }
 
 interface PendingAskUserQuestionEntry {
@@ -177,6 +186,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   private readonly protocol: CodexProtocol;
   private readonly transport: CodexTransport;
   private readonly readCodexConfig?: () => Promise<string | null>;
+  private readonly readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
   private readonly permissionService: ToolPermissionService;
   private readonly mcpConfigService: McpConfigService;
   private readonly pendingAskUserQuestions = new Map<string, PendingAskUserQuestionEntry>();
@@ -362,6 +372,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     };
 
     this.readCodexConfig = deps?.readCodexConfig;
+    this.readCodexModelCatalog = deps?.readCodexModelCatalog;
 
     // Resolve transport: explicit dep > registered resolver > SDK-specific test
     // deps > default 'app-server'.
@@ -586,6 +597,8 @@ export class OpenAICodexProvider extends BaseAgentProvider {
    * catalog does not already cover -- the only way a custom `model_providers`
    * model reaches the picker. The catalog filter still applies to SDK/API
    * discovery; these ids come from the user's own Codex configuration.
+   * Models the `model_catalog_json` catalog declares carry its exact effort
+   * levels, so the selector offers what Codex will accept for them.
    */
   private static async appendCodexConfigModels(
     models: AIModel[],
@@ -595,6 +608,25 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     if (!toml) {
       return models;
     }
+    const catalog = await (deps?.readCodexModelCatalog ?? readCodexModelCatalog)(toml);
+    return OpenAICodexProvider.withCatalogEffortLevels(
+      OpenAICodexProvider.appendConfigModelIds(models, toml),
+      catalog,
+    );
+  }
+
+  private static withCatalogEffortLevels(models: AIModel[], catalog: CodexModelCatalog): AIModel[] {
+    if (catalog.size === 0) {
+      return models;
+    }
+    return models.map((model) => {
+      const rawId = OpenAICodexProvider.toRawModelId(model.id);
+      const info = rawId ? catalog.get(rawId) : undefined;
+      return info ? { ...model, ...info } : model;
+    });
+  }
+
+  private static appendConfigModelIds(models: AIModel[], toml: string): AIModel[] {
     const seen = new Set(models.map((model) => OpenAICodexProvider.toRawModelId(model.id)));
     const extra = OpenAICodexProvider.mapSdkModelResult(parseCodexConfigModelIds(toml)).filter((model) => {
       const rawId = OpenAICodexProvider.toRawModelId(model.id);
@@ -1179,10 +1211,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       }
 
       const resolvedModel = await this.getConfiguredModel();
-      const codexModelProvider = resolveCodexModelProvider(
-        await (this.readCodexConfig ?? readCodexConfigToml)(),
-        resolvedModel,
-      );
+      const codexConfigToml = await (this.readCodexConfig ?? readCodexConfigToml)();
+      const codexModelProvider = resolveCodexModelProvider(codexConfigToml, resolvedModel);
+      // Exact effort levels the custom model catalog declares, so the thread
+      // clamps to them instead of the static per-model ceiling.
+      const catalogEffort = (await (this.readCodexModelCatalog ?? readCodexModelCatalog)(codexConfigToml))
+        .get(resolvedModel);
 
       const sessionOptions = {
         workspacePath,
@@ -1200,6 +1234,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           agentVerified: permissionDecision.agentVerified === true,
           codexConfigOverrides: this.buildCodexConfigOverrides(mcpServers),
           ...(codexModelProvider ? { codexModelProvider } : {}),
+          ...(catalogEffort ? {
+            codexSupportedEffortLevels: catalogEffort.supportedEffortLevels,
+            ...(catalogEffort.defaultEffortLevel ? { codexDefaultEffortLevel: catalogEffort.defaultEffortLevel } : {}),
+          } : {}),
           ...(codexEnv ? { codexEnv } : {}),
           ...(this.config?.effortLevel ? { effortLevel: this.config.effortLevel } : {}),
           ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),

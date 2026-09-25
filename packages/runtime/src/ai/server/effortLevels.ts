@@ -84,14 +84,44 @@ export function resolveEffortCeiling(modelId?: string): EffortLevel {
   return DEFAULT_EFFORT_CEILING;
 }
 
-/** Clamp a requested effort level down to what the model actually accepts. */
-export function clampEffortLevel(level: EffortLevel, modelId?: string): EffortLevel {
+/**
+ * Clamp a requested effort level down to what the model actually accepts.
+ *
+ * `supportedLevels` is the exact set a model's catalog declares (e.g. a custom
+ * Codex `model_catalog_json` entry). A catalog may skip levels -- DeepSeek
+ * declares low/high/max with no distinct medium/xhigh -- so an exact set is
+ * never reduced to a ceiling: an unsupported level falls to the highest
+ * supported one below it, or the lowest supported one if none is below.
+ */
+export function clampEffortLevel(
+  level: EffortLevel,
+  modelId?: string,
+  supportedLevels?: readonly EffortLevel[],
+): EffortLevel {
+  if (supportedLevels && supportedLevels.length > 0) {
+    if (supportedLevels.includes(level)) {
+      return level;
+    }
+    const sorted = [...supportedLevels].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
+    const below = sorted.filter((entry) => EFFORT_RANK[entry] < EFFORT_RANK[level]);
+    return below.length > 0 ? below[below.length - 1] : sorted[0];
+  }
   const ceiling = resolveEffortCeiling(modelId);
   return EFFORT_RANK[level] > EFFORT_RANK[ceiling] ? ceiling : level;
 }
 
-/** The effort levels to offer for a model, for the composer's effort selector. */
-export function getAvailableEffortLevels(modelId?: string): { key: EffortLevel; label: string }[] {
+/**
+ * The effort levels to offer for a model, for the composer's effort selector.
+ * An exact `supportedLevels` set from the model's catalog wins over the
+ * static per-model ceiling.
+ */
+export function getAvailableEffortLevels(
+  modelId?: string,
+  supportedLevels?: readonly EffortLevel[],
+): { key: EffortLevel; label: string }[] {
+  if (supportedLevels && supportedLevels.length > 0) {
+    return EFFORT_LEVELS.filter((entry) => supportedLevels.includes(entry.key));
+  }
   const ceiling = resolveEffortCeiling(modelId);
   return EFFORT_LEVELS.filter((entry) => EFFORT_RANK[entry.key] <= EFFORT_RANK[ceiling]);
 }
@@ -104,6 +134,10 @@ export const DEFAULT_THINKING_MODE: ThinkingMode = 'enabled';
 
 const VALID_EFFORT_LEVELS = new Set<string>(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const VALID_THINKING_MODES = new Set<string>(['enabled', 'disabled']);
+
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === 'string' && VALID_EFFORT_LEVELS.has(value);
+}
 
 /**
  * Validate and return a valid EffortLevel, or the default if invalid.

@@ -10,7 +10,12 @@ import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 import { buildCodexThreadStartParams } from '../../protocols/codexAppServer/threadConfiguration';
-import { parseCodexConfigModels } from '../codex/codexConfigModels';
+import {
+  parseCodexConfigModels,
+  parseCodexModelCatalog,
+  readCodexModelCatalog,
+  resolveCodexModelCatalogPath,
+} from '../codex/codexConfigModels';
 
 // getModels() cross-checks the OpenAI model catalogue whenever it is given an
 // API key. Unmocked, that is a real api.openai.com request from the unit suite:
@@ -28,6 +33,24 @@ vi.mock('../codex/codexConfigModels', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../codex/codexConfigModels')>()),
   readCodexConfigToml: async () => null,
 }));
+
+// Shape of a DeepSeek Codex models.json entry; extra keys stand in for the
+// fields the parser must drop.
+const deepseekLevels = [
+  { effort: 'low', description: 'Fast responses' },
+  { effort: 'high', description: 'Deep reasoning' },
+  { effort: 'max', description: 'Maximum reasoning' },
+];
+const deepseekCatalogJson = JSON.stringify({
+  models: ['deepseek-flash', 'deepseek-v4-pro'].map((slug) => ({
+    slug,
+    display_name: slug,
+    base_instructions: 'You are Codex',
+    experimental_bearer_token: 'sk-catalog-SECRET',
+    default_reasoning_level: 'high',
+    supported_reasoning_levels: deepseekLevels,
+  })),
+});
 
 function createAsyncEventStream(events: any[]): AsyncIterable<any> {
   return {
@@ -321,6 +344,73 @@ describe('OpenAICodexProvider', () => {
       'openai-codex:deepseek-flash',
       'openai-codex:deepseek-v4-pro',
     ]);
+  });
+
+  it('attaches catalog effort levels to catalog models and leaves built-in GPT models on the static ceilings', async () => {
+    const models = await OpenAICodexProvider.getModels(undefined, {
+      loadSdkModule: async () => {
+        throw new Error('sdk unavailable');
+      },
+      readCodexConfig: async () => 'model = "deepseek-flash"\nmodel_provider = "deepseek"\n[profiles.pro]\nmodel = "deepseek-v4-pro"\n',
+      readCodexModelCatalog: async () => parseCodexModelCatalog(deepseekCatalogJson),
+    });
+    const byId = new Map(models.map((model) => [model.id, model]));
+    for (const id of ['openai-codex:deepseek-flash', 'openai-codex:deepseek-v4-pro']) {
+      expect(byId.get(id)?.supportedEffortLevels).toEqual(['low', 'high', 'max']);
+      expect(byId.get(id)?.defaultEffortLevel).toBe('high');
+    }
+    expect(byId.get('openai-codex:gpt-6-sol')?.supportedEffortLevels).toBeUndefined();
+    expect(JSON.stringify(models)).not.toContain('SECRET');
+  });
+
+  describe('model_catalog_json', () => {
+    it('keeps only effort capabilities and drops unknown or malformed entries', () => {
+      const catalog = parseCodexModelCatalog(deepseekCatalogJson);
+      expect([...catalog.entries()]).toEqual([
+        ['deepseek-flash', { supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' }],
+        ['deepseek-v4-pro', { supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' }],
+      ]);
+      expect(parseCodexModelCatalog('not json').size).toBe(0);
+      expect(parseCodexModelCatalog('{"models":{}}').size).toBe(0);
+      // A model with no level Nimbalyst can name keeps the static fallback.
+      expect(parseCodexModelCatalog(JSON.stringify({
+        models: [{ slug: 'odd', supported_reasoning_levels: [{ effort: 'none' }], default_reasoning_level: 'none' }],
+      })).size).toBe(0);
+    });
+
+    it('resolves the catalog path config.toml names, with ~ and relative paths', () => {
+      const home = '/home/u';
+      const codexHome = '/custom/codex';
+      expect(resolveCodexModelCatalogPath('model_catalog_json = "~/.codex/models.json"\n', codexHome, home))
+        .toBe('/home/u/.codex/models.json');
+      expect(resolveCodexModelCatalogPath("model_catalog_json = 'catalogs/ds.json'\n", codexHome, home))
+        .toBe('/custom/codex/catalogs/ds.json');
+      expect(resolveCodexModelCatalogPath('model_catalog_json = "/etc/models.json"\n', codexHome, home))
+        .toBe('/etc/models.json');
+      // Only the top-level key counts; a table's key of the same name is someone else's.
+      expect(resolveCodexModelCatalogPath('model = "x"\n[profiles.p]\nmodel_catalog_json = "/p.json"\n', codexHome, home))
+        .toBeNull();
+    });
+
+    it('reads the catalog from CODEX_HOME and falls back to empty when it is missing or invalid', async () => {
+      const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-catalog-'));
+      const previous = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = codexHome;
+      try {
+        await fs.writeFile(path.join(codexHome, 'models.json'), deepseekCatalogJson);
+        await fs.writeFile(path.join(codexHome, 'bad.json'), '{');
+        expect((await readCodexModelCatalog('model_catalog_json = "models.json"\n')).get('deepseek-flash')?.supportedEffortLevels)
+          .toEqual(['low', 'high', 'max']);
+        expect((await readCodexModelCatalog('model_catalog_json = "missing.json"\n')).size).toBe(0);
+        expect((await readCodexModelCatalog('model_catalog_json = "bad.json"\n')).size).toBe(0);
+        expect((await readCodexModelCatalog('model = "deepseek-flash"\n')).size).toBe(0);
+        expect((await readCodexModelCatalog(null)).size).toBe(0);
+      } finally {
+        if (previous === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previous;
+        await fs.rm(codexHome, { recursive: true, force: true });
+      }
+    });
   });
 
   it('leaves custom-provider model ids untouched when normalizing', () => {
@@ -2080,12 +2170,17 @@ describe('OpenAICodexProvider', () => {
         'model_provider = "local-llm"',
       ].join('\n');
 
-      async function threadParamsFor(model: string, toml: string | null) {
+      async function threadParamsFor(
+        model: string,
+        toml: string | null,
+        opts: { catalogJson?: string; effortLevel?: string } = {},
+      ) {
         OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
         const createSession = vi.fn(async () => ({ id: 'thread-provider', platform: 'codex-app-server', raw: {} }));
         const provider = new OpenAICodexProvider({}, {
           transport: 'app-server',
           readCodexConfig: async () => toml,
+          readCodexModelCatalog: async () => parseCodexModelCatalog(opts.catalogJson ?? ''),
           protocol: {
             platform: 'codex-app-server',
             createSession,
@@ -2096,7 +2191,10 @@ describe('OpenAICodexProvider', () => {
             cleanupSession: vi.fn(),
           } as any,
         });
-        await provider.initialize({ model: `openai-codex:${model}` });
+        await provider.initialize({
+          model: `openai-codex:${model}`,
+          ...(opts.effortLevel ? { effortLevel: opts.effortLevel as any } : {}),
+        });
         for await (const _chunk of provider.sendMessage('hi', undefined, `session-${model}`, [], process.cwd())) {
           // drain
         }
@@ -2113,6 +2211,25 @@ describe('OpenAICodexProvider', () => {
         const params = await threadParamsFor(model, deepseekConfig);
         expect(params.model).toBe(model);
         expect(params.modelProvider).toBe(expected);
+      });
+
+      it('sends catalog effort levels to Codex unchanged and clamps to the exact set', async () => {
+        const catalogJson = deepseekCatalogJson;
+        const effortFor = async (effortLevel?: string) =>
+          (await threadParamsFor('deepseek-flash', deepseekConfig, { catalogJson, effortLevel })).config?.model_reasoning_effort;
+        expect(await effortFor('max')).toBe('max');
+        expect(await effortFor('low')).toBe('low');
+        // xhigh is not a distinct DeepSeek level; it lands on high, never on max.
+        expect(await effortFor('xhigh')).toBe('high');
+        expect(await effortFor('ultra')).toBe('max');
+        // No effort preference at all: the catalog's default_reasoning_level.
+        expect(await effortFor(undefined)).toBe('high');
+        // Without a catalog the existing static fallback is untouched: xhigh passes through.
+        expect((await threadParamsFor('deepseek-flash', deepseekConfig, { effortLevel: 'xhigh' })).config?.model_reasoning_effort)
+          .toBe('xhigh');
+        // A built-in model absent from the catalog keeps its static ceiling.
+        expect((await threadParamsFor('gpt-6-sol', deepseekConfig, { catalogJson, effortLevel: 'ultra' })).config?.model_reasoning_effort)
+          .toBe('ultra');
       });
 
       it('leaves the provider to Codex when config.toml configures none', async () => {

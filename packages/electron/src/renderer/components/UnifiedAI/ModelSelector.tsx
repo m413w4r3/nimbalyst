@@ -19,6 +19,7 @@ import { getClaudeCodeModelLabel } from '../../utils/modelUtils';
 import { advancedSettingsAtom, aiProviderSettingsAtom } from '../../store/atoms/appSettings';
 import { setWindowModeAtom } from '../../store/atoms/windowMode';
 import { navigateToSettingsAtom } from '../../store/atoms/settingsNavigation';
+import { collectModelEffortLevels, modelEffortLevelsAtom } from '../../store/atoms/modelEffortLevels';
 import type { SettingsCategory } from '../Settings/SettingsSidebar';
 import { AlphaBadge } from '../common/AlphaBadge';
 import { HelpTooltip } from '../../help';
@@ -86,6 +87,7 @@ export function ModelSelector({
   const { providers } = aiProviderSettings;
   const setWindowMode = useSetAtom(setWindowModeAtom);
   const navigateToSettings = useSetAtom(navigateToSettingsAtom);
+  const setModelEffortLevels = useSetAtom(modelEffortLevelsAtom);
   const menuRef = React.useRef<HTMLDivElement>(null);
   const lastOpenRequestRef = React.useRef(openRequest);
   const typeaheadQueryRef = React.useRef('');
@@ -117,6 +119,7 @@ export function ModelSelector({
       const response = await window.electronAPI.aiGetModels();
       if (response.success && response.grouped) {
         setModels(response.grouped);
+        setModelEffortLevels(collectModelEffortLevels(response.grouped));
         const meta = response as {
           providerLabels?: Record<string, string>;
           providerIcons?: Record<string, string>;
@@ -129,7 +132,7 @@ export function ModelSelector({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setModelEffortLevels]);
 
   React.useLayoutEffect(() => {
     if (openRequest === undefined || openRequest === lastOpenRequestRef.current) return;

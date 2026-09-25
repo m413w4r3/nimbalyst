@@ -122,3 +122,27 @@ describe('per-model effort ceilings', () => {
     ]);
   });
 });
+
+describe('exact catalog effort levels', () => {
+  // A custom Codex model_catalog_json (DeepSeek) declares low/high/max with no
+  // distinct medium/xhigh; the set must not be reduced to a ceiling.
+  const deepseek = ['low', 'high', 'max'] as const;
+
+  it('offers exactly the declared levels', () => {
+    expect(getAvailableEffortLevels('openai-codex:deepseek-flash', [...deepseek]).map((l) => l.key))
+      .toEqual(['low', 'high', 'max']);
+  });
+
+  it('accepts declared levels unchanged and moves undeclared ones down to a declared one', () => {
+    expect(clampEffortLevel('max', 'openai-codex:deepseek-flash', deepseek)).toBe('max');
+    expect(clampEffortLevel('xhigh', 'openai-codex:deepseek-flash', deepseek)).toBe('high');
+    expect(clampEffortLevel('medium', 'openai-codex:deepseek-flash', deepseek)).toBe('low');
+    expect(clampEffortLevel('ultra', 'openai-codex:deepseek-flash', deepseek)).toBe('max');
+    expect(clampEffortLevel('low', 'm', ['high', 'max'])).toBe('high');
+  });
+
+  it('falls back to the static ceiling when no levels are declared', () => {
+    expect(clampEffortLevel('max', 'openai-codex:deepseek-flash', [])).toBe('xhigh');
+    expect(getAvailableEffortLevels('openai-codex:deepseek-flash').map((l) => l.key)).not.toContain('max');
+  });
+});

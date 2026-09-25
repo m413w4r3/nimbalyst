@@ -1,7 +1,7 @@
 import type { SessionOptions } from '../ProtocolInterface';
 import type { ThreadStartParams } from './types';
 import { resolveCodexPermissionProfile } from '../codexPermissionProfile';
-import { clampEffortLevel, parseEffortLevel } from '../../effortLevels';
+import { clampEffortLevel, parseEffortLevel, type EffortLevel } from '../../effortLevels';
 
 export function buildCodexThreadStartParams(options: SessionOptions): ThreadStartParams {
   const permissionProfile = resolveCodexPermissionProfile(
@@ -10,11 +10,16 @@ export function buildCodexThreadStartParams(options: SessionOptions): ThreadStar
   );
 
   const effortLevel = options.raw?.effortLevel as string | undefined;
+  // A custom model catalog (config.toml `model_catalog_json`) declares the
+  // model's exact levels and default; the host resolves them per model.
+  const supportedEffortLevels = options.raw?.codexSupportedEffortLevels as EffortLevel[] | undefined;
+  const defaultEffortLevel = options.raw?.codexDefaultEffortLevel as EffortLevel | undefined;
   // Clamp to what this model's catalog entry accepts: gpt-5.4/5.5 stop at
   // xhigh, the Luna tiers at max, and only Astra/Sol/Terra reach ultra.
   const reasoningEffortRaw = clampEffortLevel(
-    parseEffortLevel(effortLevel ?? 'high'),
+    parseEffortLevel(effortLevel ?? defaultEffortLevel ?? 'high'),
     options.model ?? undefined,
+    supportedEffortLevels,
   );
 
   const systemPrompt = (options.raw?.systemPrompt as string | undefined) ?? options.systemPrompt;

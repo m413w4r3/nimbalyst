@@ -29,7 +29,7 @@
 import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
 import { describeCodexConfigError } from './codexConfigError';
 import { resolveCodexPermissionProfile } from './codexPermissionProfile';
-import { clampEffortLevel, parseEffortLevel } from '../effortLevels';
+import { clampEffortLevel, parseEffortLevel, type EffortLevel } from '../effortLevels';
 import {
   AgentProtocol,
   ProtocolSession,
@@ -399,8 +399,9 @@ export class CodexSDKProtocol implements AgentProtocol {
     // stop at xhigh, the Luna tiers at max, and only Astra/Sol/Terra reach ultra.
     const effortLevel = options.raw?.effortLevel as string | undefined;
     const reasoningEffort = clampEffortLevel(
-      parseEffortLevel(effortLevel || 'high'),
+      parseEffortLevel(effortLevel || (options.raw?.codexDefaultEffortLevel as string | undefined) || 'high'),
       options.model || undefined,
+      options.raw?.codexSupportedEffortLevels as EffortLevel[] | undefined,
     );
 
     const baseOptions = {
