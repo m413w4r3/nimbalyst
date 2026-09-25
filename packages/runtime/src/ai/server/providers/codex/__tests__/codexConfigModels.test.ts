@@ -40,6 +40,7 @@ describe('Codex profile-v2 model discovery', () => {
     codexHome = path.join(homeDir, 'custom-codex');
     await fs.mkdir(codexHome);
     await fs.writeFile(path.join(codexHome, 'config.toml'), [
+      'model_provider = "deepseek"',
       '[model_providers.deepseek]',
       'base_url = "https://api.deepseek.com"',
       'env_key = "DEEPSEEK_API_KEY"',
@@ -55,6 +56,9 @@ describe('Codex profile-v2 model discovery', () => {
     ].join('\n'));
     await fs.writeFile(path.join(homeDir, 'models.json'), deepseekCatalog);
     await fs.writeFile(path.join(codexHome, 'qwen-model-catalog.json'), qwenCatalog);
+    await fs.writeFile(path.join(codexHome, 'luna-model-catalog.json'), catalog([
+      { slug: 'gpt-6-luna', levels: ['low'], defaultLevel: 'low' },
+    ]));
     await fs.writeFile(path.join(codexHome, 'deepseek-flash.config.toml'), [
       'model = "deepseek-flash"',
       'model_provider = "deepseek"',
@@ -73,8 +77,16 @@ describe('Codex profile-v2 model discovery', () => {
     ].join('\n'));
     // Malformed: unquoted catalog path, which Codex itself refuses to load.
     await fs.writeFile(path.join(codexHome, 'qwen3-coder.config.toml'), 'model = "Qwen3-32B"\nmodel_provider = "chaps_qwen"\nmodel_catalog_json = ~/q.json\n');
-    // An OpenAI tuning profile is not a model of its own.
-    await fs.writeFile(path.join(codexHome, 'quick.config.toml'), 'model = "gpt-6-luna"\nmodel_reasoning_effort = "low"\n');
+    // An explicit OpenAI tuning profile is not a model of its own.
+    await fs.writeFile(path.join(codexHome, 'quick.config.toml'), 'model = "gpt-6-luna"\nmodel_provider = "openai"\nmodel_reasoning_effort = "low"\n');
+    // A custom profile must not hijack a built-in OpenAI slug.
+    await fs.writeFile(path.join(codexHome, 'luna.config.toml'), [
+      'model = "gpt-6-luna"',
+      'model_provider = "deepseek"',
+      'model_catalog_json = "luna-model-catalog.json"',
+    ].join('\n'));
+    // A modern profile inherits the top-level provider when it omits one.
+    await fs.writeFile(path.join(codexHome, 'inherited-worker.config.toml'), 'model = "inherited-deepseek-model"\n');
     await fs.writeFile(path.join(codexHome, 'empty.config.toml'), '[tui]\nmodel = "not-top-level"\n');
     await fs.writeFile(path.join(codexHome, '.config.toml'), 'model = "nameless"\nmodel_provider = "x"\n');
   });
@@ -88,6 +100,11 @@ describe('Codex profile-v2 model discovery', () => {
     expect(resolveCodexHome({})).toBe(path.join(os.homedir(), '.codex'));
   });
 
+  it('discovers models from CODEX_HOME in the merged environment', async () => {
+    const discovery = await discoverCodexModels({ env: { CODEX_HOME: codexHome }, homeDir });
+    expect(resolveCodexModel(discovery, 'deepseek-flash')).toMatchObject({ provider: 'deepseek', profile: 'deepseek-flash' });
+  });
+
   it('discovers profile files with their own catalogs, before legacy entries, skipping malformed ones', async () => {
     const discovery = await discoverCodexModels({ codexHome, homeDir });
     expect(discovery.models).toEqual([
@@ -97,7 +114,12 @@ describe('Codex profile-v2 model discovery', () => {
         profile: 'deepseek-flash',
         catalogPath: path.join(homeDir, 'models.json'),
         supportedEffortLevels: ['low', 'high', 'max'],
-        defaultEffortLevel: 'high',
+        defaultEffortLevel: 'max',
+      },
+      {
+        model: 'inherited-deepseek-model',
+        provider: 'deepseek',
+        profile: 'inherited-worker',
       },
       {
         model: 'Qwen3-Coder-30B-A3B-Instruct-ovh',
@@ -124,13 +146,10 @@ describe('Codex profile-v2 model discovery', () => {
     }
     // With nothing custom configured, Codex keeps its default provider.
     const bare = await discoverCodexModels({ codexHome: path.join(homeDir, 'missing'), homeDir });
-    expect(resolveCodexModel(bare, 'gpt-6-sol')).toEqual({ model: 'gpt-6-sol' });
+    expect(resolveCodexModel(bare, 'gpt-6-sol')).toEqual({ model: 'gpt-6-sol', provider: 'openai' });
   });
 
-  it('uses the profile effort as default only when the catalog declares none', async () => {
-    await fs.writeFile(path.join(homeDir, 'models.json'), catalog([
-      { slug: 'deepseek-flash', levels: ['low', 'high', 'max'], defaultLevel: null },
-    ]));
+  it('lets profile model_reasoning_effort override the catalog default', async () => {
     const discovery = await discoverCodexModels({ codexHome, homeDir });
     expect(resolveCodexModel(discovery, 'deepseek-flash').defaultEffortLevel).toBe('max');
   });
@@ -155,6 +174,9 @@ describe('model_catalog_json parsing', () => {
       ['deepseek-v4-pro', { supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' }],
     ]);
     expect(parseCodexModelCatalog(qwenCatalog).get('Qwen3-Coder-30B-A3B-Instruct-ovh')).toEqual({ supportedEffortLevels: [] });
+    expect(parseCodexModelCatalog(catalog([
+      { slug: 'future-model', levels: ['future-unknown-value'], defaultLevel: 'future-unknown-value' },
+    ])).has('future-model')).toBe(false);
     expect(parseCodexModelCatalog('not json').size).toBe(0);
     expect(parseCodexModelCatalog('{"models":{}}').size).toBe(0);
     expect(parseCodexModelCatalog('{"models":[{"slug":"no-levels-key"}]}').size).toBe(0);

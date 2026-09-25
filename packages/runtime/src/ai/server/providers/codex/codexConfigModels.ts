@@ -6,6 +6,19 @@ import { isEffortLevel, type EffortLevel } from '../../effortLevels';
 /** Codex's built-in provider id for OpenAI's own models. */
 export const CODEX_OPENAI_MODEL_PROVIDER = 'openai';
 
+/** Model slugs owned by Codex's built-in OpenAI catalog. */
+export const CODEX_BUILTIN_OPENAI_MODEL_IDS = new Set([
+  'gpt-6-sol',
+  'gpt-6-astra',
+  'gpt-6-luna',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+]);
+
 const PROFILE_SUFFIX = '.config.toml';
 
 /**
@@ -40,6 +53,12 @@ export interface CodexModelDiscovery {
    * which leaves Codex's default untouched.
    */
   pinsOpenAIProvider: boolean;
+}
+
+export interface CodexModelDiscoveryOptions {
+  codexHome?: string;
+  homeDir?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Effort capabilities a custom model catalog declares for one model. */
@@ -127,13 +146,14 @@ export function parseCodexProfile(
   toml: string,
   codexHome: string,
   homeDir: string = os.homedir(),
+  inheritedProvider?: string,
 ): CodexProfile | null {
   const values = readTopLevelStrings(toml, ['model', 'model_provider', 'model_reasoning_effort', 'model_catalog_json']);
   const model = values.get('model');
   if (!model || [...values.values()].includes(null)) {
     return null;
   }
-  const provider = values.get('model_provider');
+  const provider = values.get('model_provider') ?? inheritedProvider;
   const effort = values.get('model_reasoning_effort');
   const catalog = values.get('model_catalog_json');
   return {
@@ -229,11 +249,20 @@ export function parseCodexModelCatalog(json: string): CodexModelCatalog {
       continue;
     }
     const supportedEffortLevels: EffortLevel[] = [];
+    let hasUnknownEffortLevel = false;
     for (const level of levels) {
       const effort = (level as { effort?: unknown } | null)?.effort;
       if (isEffortLevel(effort) && !supportedEffortLevels.includes(effort)) {
         supportedEffortLevels.push(effort);
+      } else {
+        hasUnknownEffortLevel = true;
       }
+    }
+    // A non-empty list containing metadata this version does not understand is
+    // not authoritative. Do not collapse an unknown-only list into []: only an
+    // explicit empty array means that the model supports no reasoning levels.
+    if (hasUnknownEffortLevel) {
+      continue;
     }
     const declaredDefault = (entry as { default_reasoning_level?: unknown }).default_reasoning_level;
     catalog.set(slug.trim(), {
@@ -255,7 +284,11 @@ async function readText(filePath: string): Promise<string | null> {
 }
 
 /** Every well-formed `$CODEX_HOME/<name>.config.toml`, sorted by name. */
-export async function readCodexProfiles(codexHome: string, homeDir: string = os.homedir()): Promise<CodexProfile[]> {
+export async function readCodexProfiles(
+  codexHome: string,
+  homeDir: string = os.homedir(),
+  inheritedProvider?: string,
+): Promise<CodexProfile[]> {
   let names: string[];
   try {
     names = await fs.readdir(codexHome);
@@ -265,7 +298,9 @@ export async function readCodexProfiles(codexHome: string, homeDir: string = os.
   const profiles: CodexProfile[] = [];
   for (const file of names.filter((entry) => entry.endsWith(PROFILE_SUFFIX) && entry.length > PROFILE_SUFFIX.length).sort()) {
     const toml = await readText(path.join(codexHome, file));
-    const profile = toml === null ? null : parseCodexProfile(file.slice(0, -PROFILE_SUFFIX.length), toml, codexHome, homeDir);
+    const profile = toml === null
+      ? null
+      : parseCodexProfile(file.slice(0, -PROFILE_SUFFIX.length), toml, codexHome, homeDir, inheritedProvider);
     if (profile) {
       profiles.push(profile);
     }
@@ -280,9 +315,9 @@ export async function readCodexProfiles(codexHome: string, homeDir: string = os.
  * Each model's effort levels come from the catalog its own config names.
  */
 export async function discoverCodexModels(
-  options: { codexHome?: string; homeDir?: string } = {},
+  options: CodexModelDiscoveryOptions = {},
 ): Promise<CodexModelDiscovery> {
-  const codexHome = options.codexHome ?? resolveCodexHome();
+  const codexHome = options.codexHome ?? resolveCodexHome(options.env);
   const homeDir = options.homeDir ?? os.homedir();
   const catalogs = new Map<string, Promise<CodexModelCatalog>>();
   const readCatalog = (catalogPath: string): Promise<CodexModelCatalog> => {
@@ -294,16 +329,26 @@ export async function discoverCodexModels(
     return catalog;
   };
 
+  const configToml = await readText(path.join(codexHome, 'config.toml'));
+  const inheritedProvider = configToml
+    ? readTopLevelStrings(configToml, ['model_provider']).get('model_provider') ?? undefined
+    : undefined;
+
   const models: CodexCustomModel[] = [];
-  for (const profile of await readCodexProfiles(codexHome, homeDir)) {
-    if (!profile.provider || profile.provider === CODEX_OPENAI_MODEL_PROVIDER || models.some((entry) => entry.model === profile.model)) {
+  for (const profile of await readCodexProfiles(codexHome, homeDir, inheritedProvider)) {
+    if (
+      !profile.provider
+      || profile.provider === CODEX_OPENAI_MODEL_PROVIDER
+      || CODEX_BUILTIN_OPENAI_MODEL_IDS.has(profile.model)
+      || models.some((entry) => entry.model === profile.model)
+    ) {
       continue;
     }
     const info = profile.catalogPath ? (await readCatalog(profile.catalogPath)).get(profile.model) : undefined;
     const profileDefault = profile.reasoningEffort && (!info || info.supportedEffortLevels.includes(profile.reasoningEffort))
       ? profile.reasoningEffort
       : undefined;
-    const defaultEffortLevel = info?.defaultEffortLevel ?? profileDefault;
+    const defaultEffortLevel = profileDefault ?? info?.defaultEffortLevel;
     models.push({
       model: profile.model,
       provider: profile.provider,
@@ -314,7 +359,6 @@ export async function discoverCodexModels(
     });
   }
 
-  const configToml = await readText(path.join(codexHome, 'config.toml'));
   const baseCatalogPath = configToml ? resolveCodexModelCatalogPath(configToml, codexHome, homeDir) : null;
   const baseCatalog = baseCatalogPath ? await readCatalog(baseCatalogPath) : new Map() as CodexModelCatalog;
   for (const legacy of configToml ? parseCodexConfigModels(configToml) : []) {
@@ -337,6 +381,9 @@ export async function discoverCodexModels(
  * Codex's built-in `openai` provider, with no profile.
  */
 export function resolveCodexModel(discovery: CodexModelDiscovery, model: string): CodexCustomModel {
+  if (CODEX_BUILTIN_OPENAI_MODEL_IDS.has(model)) {
+    return { model, provider: CODEX_OPENAI_MODEL_PROVIDER };
+  }
   const declared = discovery.models.find((entry) => entry.model === model);
   if (declared) {
     return declared.provider || !discovery.pinsOpenAIProvider

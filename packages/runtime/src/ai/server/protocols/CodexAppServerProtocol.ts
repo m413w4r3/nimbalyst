@@ -32,6 +32,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
 import { codexProfileLaunchArgs, type CodexCustomModel } from '../providers/codex/codexConfigModels';
+import { logCodexRoute } from '../codexRoutingDiagnostics';
 import { describeCodexConfigError } from './codexConfigError';
 import { reverseCodexPatch, type CodexPatchKind } from '../providers/codex/patchReverse';
 import {
@@ -168,7 +169,19 @@ export class CodexAppServerProtocol implements AgentProtocol {
   async createSession(options: SessionOptions): Promise<ProtocolSession> {
     const raw = await this.spawnAndInit(options);
     const startParams = buildCodexThreadStartParams(raw.options);
+    logCodexRoute('thread/start', {
+      model: startParams.model ?? null,
+      modelProvider: startParams.modelProvider ?? null,
+      reasoningEffort: startParams.config?.model_reasoning_effort ?? null,
+    });
     const startResponse = await raw.client.request<ThreadStartResponse>('thread/start', startParams).then(async response => {
+      const responseRouting: Record<string, unknown> = { threadId: response?.thread?.id ?? null };
+      if (response?.model !== undefined) responseRouting.model = response.model;
+      const modelProvider = response?.modelProvider ?? response?.thread?.modelProvider;
+      if (modelProvider !== undefined) responseRouting.modelProvider = modelProvider;
+      // Codex 0.157 does not always return model/provider here; request-side
+      // routing above is the authoritative observable at this boundary.
+      logCodexRoute('thread/start response', responseRouting);
       await validateCodexSandbox(response.sandbox, startParams.sandbox, raw.client);
       return response;
     }).catch(error => {
@@ -216,8 +229,21 @@ export class CodexAppServerProtocol implements AgentProtocol {
     if (model !== null && model !== undefined) {
       resumeParams.model = model;
     }
+    logCodexRoute('thread/resume', {
+      threadId: sessionId,
+      model: resumeParams.model ?? null,
+      modelProvider: resumeParams.modelProvider ?? null,
+      reasoningEffort: startParams.config?.model_reasoning_effort ?? null,
+    });
     try {
       const resumeResponse = await raw.client.request<ThreadResumeResponse>('thread/resume', resumeParams);
+      const responseRouting: Record<string, unknown> = { threadId: resumeResponse?.thread?.id ?? sessionId };
+      if (resumeResponse?.model !== undefined) responseRouting.model = resumeResponse.model;
+      const modelProvider = resumeResponse?.modelProvider ?? resumeResponse?.thread?.modelProvider;
+      if (modelProvider !== undefined) responseRouting.modelProvider = modelProvider;
+      // Codex 0.157 does not always return model/provider here; request-side
+      // routing is the authoritative observable at this protocol boundary.
+      logCodexRoute('thread/resume response', responseRouting);
       await validateCodexSandbox(resumeResponse.sandbox, startParams.sandbox, raw.client);
       raw.threadId = resumeResponse?.thread?.id ?? sessionId;
       // console.log('[CODEX][APPSERVER] thread resumed:', raw.threadId);
@@ -492,6 +518,13 @@ export class CodexAppServerProtocol implements AgentProtocol {
     // A profile-backed custom model layers its profile's model metadata on
     // this child; built-in OpenAI models launch plain app-server.
     const profileArgs = codexProfileLaunchArgs(options.raw?.codexProfile as CodexCustomModel | undefined);
+    const codexProfile = options.raw?.codexProfile as CodexCustomModel | undefined;
+    logCodexRoute('app-server spawn', {
+      model: options.model ?? null,
+      provider: options.raw?.codexModelProvider ?? null,
+      profile: codexProfile?.profile ?? null,
+      profileOverrides: profileArgs,
+    });
     const child = spawn(binary, [...(tracking?.args ?? []), 'app-server', ...profileArgs, '--listen', 'stdio://'], {
       env,
       cwd,

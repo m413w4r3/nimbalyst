@@ -34,7 +34,9 @@ import {
   discoverCodexModels,
   resolveCodexModel,
   type CodexModelDiscovery,
+  type CodexModelDiscoveryOptions,
 } from './codex/codexConfigModels';
+import { logCodexRoute, type CodexRoutingSnapshot } from '../codexRoutingDiagnostics';
 import { resolveCodexReasoningEffort } from '../protocols/codexAppServer/threadConfiguration';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
@@ -87,12 +89,12 @@ interface OpenAICodexProviderDeps {
   /** Injectable scheduler keeps lifecycle tests deterministic without global fake timers. */
   idleProtocolSessionScheduler?: ProtocolSessionIdleScheduler;
   /** Custom models from the Codex home; defaults to the user's real `CODEX_HOME`. */
-  discoverCodexModels?: () => Promise<CodexModelDiscovery>;
+  discoverCodexModels?: (options?: CodexModelDiscoveryOptions) => Promise<CodexModelDiscovery>;
 }
 
 interface OpenAICodexModelDiscoveryDeps {
   loadSdkModule?: () => Promise<CodexSdkModuleLike>;
-  discoverCodexModels?: () => Promise<CodexModelDiscovery>;
+  discoverCodexModels?: (options?: CodexModelDiscoveryOptions) => Promise<CodexModelDiscovery>;
 }
 
 interface PendingAskUserQuestionEntry {
@@ -241,6 +243,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
    */
   private readonly liveProtocolSessions = new Map<string, ProtocolSession>();
   private readonly liveProtocolSessionPermissionKeys = new Map<string, string>();
+  private readonly liveProtocolSessionRouting = new Map<string, CodexRoutingSnapshot>();
   private readonly activeProtocolSessionCounts = new Map<string, number>();
   private readonly protocolSessionIdleTimers = new Map<
     string,
@@ -599,7 +602,9 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     models: AIModel[],
     deps?: OpenAICodexModelDiscoveryDeps,
   ): Promise<AIModel[]> {
-    const discovery = await (deps?.discoverCodexModels ?? discoverCodexModels)();
+    const discovery = await (deps?.discoverCodexModels ?? discoverCodexModels)({
+      env: OpenAICodexProvider.buildCodexEnvironment() ?? process.env,
+    });
     const seen = new Set(models.map((model) => OpenAICodexProvider.toRawModelId(model.id)));
     const declared = OpenAICodexProvider.mapSdkModelResult(discovery.models.map((entry) => entry.model))
       .filter((model) => {
@@ -1135,11 +1140,18 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
         : [];
 
+      // Use this exact merged environment for both model discovery and the
+      // eventual child spawn, so CODEX_HOME follows the same shell layering.
+      let codexEnv = OpenAICodexProvider.buildCodexEnvironment();
+
       // The child and thread are bound to one model, provider, profile and
       // effort, so any change reattaches instead of reusing a live child.
+      const requestedModel = this.config?.model ?? OpenAICodexProvider.DEFAULT_MODEL;
       const resolvedModel = await this.getConfiguredModel();
       const codexModel = resolveCodexModel(
-        await (this.discoverCodexModels ?? discoverCodexModels)(),
+        await (this.discoverCodexModels ?? discoverCodexModels)({
+          env: codexEnv ?? process.env,
+        }),
         resolvedModel,
       );
       const reasoningEffort = resolveCodexReasoningEffort(
@@ -1148,6 +1160,20 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         codexModel.supportedEffortLevels,
         codexModel.defaultEffortLevel,
       );
+      const routingSnapshot: CodexRoutingSnapshot = {
+        model: resolvedModel,
+        provider: codexModel.provider ?? null,
+        profile: codexModel.profile ?? null,
+        reasoningEffort,
+      };
+      logCodexRoute('resolved', {
+        requestedModel: requestedModel.replace(/^openai-codex:/, ''),
+        resolvedModel,
+        provider: routingSnapshot.provider,
+        profile: routingSnapshot.profile,
+        reasoningEffort: routingSnapshot.reasoningEffort,
+        ...(codexModel.catalogPath ? { catalogPath: codexModel.catalogPath } : {}),
+      });
       const permissionKey = JSON.stringify([
         codexSessionConfigurationKey(permissionDecision.permissionMode, permissionDecision.agentVerified === true, workspacePath, additionalDirectories),
         resolvedModel,
@@ -1161,6 +1187,19 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         cachedLiveSession &&
         this.liveProtocolSessionPermissionKeys.get(sessionId) !== permissionKey
       ) {
+        const previousRouting = this.liveProtocolSessionRouting.get(sessionId);
+        const routingChanged = previousRouting
+          && (previousRouting.model !== routingSnapshot.model
+            || previousRouting.provider !== routingSnapshot.provider
+            || previousRouting.profile !== routingSnapshot.profile
+            || previousRouting.reasoningEffort !== routingSnapshot.reasoningEffort);
+        if (routingChanged) {
+          logCodexRoute('reattach', {
+            reason: 'routing configuration changed',
+            previous: previousRouting,
+            next: routingSnapshot,
+          });
+        }
         // Sandbox and approval settings are fixed when a Codex thread is
         // attached to an app-server child. Reattach the persisted thread when
         // project permissions change so Agent-verified takes effect on the
@@ -1187,11 +1226,6 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         'nimbalyst',
       );
       let usedSessionNamingToolThisTurn = false;
-
-      // Build environment for the Codex CLI binary.
-      // Electron GUI apps have a minimal process.env (missing docker, homebrew, nvm, etc.).
-      // Merge in shell env vars and the enhanced PATH so the Codex agent can see system tools.
-      let codexEnv = OpenAICodexProvider.buildCodexEnvironment();
 
       // The SDK pre-edit hook uses Electron as Node and writes snapshots to
       // this session's sidecar directory. App-server observation is host-owned.
@@ -1289,6 +1323,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       if (sessionId && !cachedLiveSession) {
         this.liveProtocolSessions.set(sessionId, session);
         this.liveProtocolSessionPermissionKeys.set(sessionId, permissionKey);
+        this.liveProtocolSessionRouting.set(sessionId, routingSnapshot);
       }
 
       // Persist a newly created thread ID immediately, before streaming the
@@ -1548,6 +1583,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     this.cancelProtocolSessionIdleTimer(sessionId);
     const cached = this.liveProtocolSessions.get(sessionId);
     this.liveProtocolSessionPermissionKeys.delete(sessionId);
+    this.liveProtocolSessionRouting.delete(sessionId);
     if (!cached) return;
     this.liveProtocolSessions.delete(sessionId);
     try { this.protocol.cleanupSession(cached); }
@@ -1965,6 +2001,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     }
     this.liveProtocolSessions.clear();
     this.liveProtocolSessionPermissionKeys.clear();
+    this.liveProtocolSessionRouting.clear();
     this.appServerNotificationDeduper.clear();
     // Clear permission service caches
     this.permissionService.clearSessionCache();

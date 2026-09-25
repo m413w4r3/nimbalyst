@@ -46,7 +46,13 @@ const qwenModel: CodexCustomModel = {
   supportedEffortLevels: [],
 };
 const profileDiscovery = (): CodexModelDiscovery => ({
-  models: [deepseekModel, qwenModel, { model: 'my-local-model', provider: 'local-llm' }],
+  models: [
+    deepseekModel,
+    qwenModel,
+    { model: 'my-local-model', provider: 'local-llm' },
+    // A custom profile with a built-in slug must not override OpenAI routing.
+    { model: 'gpt-6-luna', provider: 'deepseek', profile: 'luna', supportedEffortLevels: ['low'], defaultEffortLevel: 'low' },
+  ],
   baseCatalog: new Map(),
   pinsOpenAIProvider: true,
 });
@@ -2139,8 +2145,8 @@ describe('OpenAICodexProvider', () => {
         expect((await effortFor('gpt-6-sol', 'ultra'))?.model_reasoning_effort).toBe('ultra');
       });
 
-      it('leaves the provider to Codex when nothing custom is configured', async () => {
-        expect((await threadParamsFor('gpt-6-sol', emptyCodexModelDiscovery())).params.modelProvider).toBeUndefined();
+      it('pins built-in OpenAI models to the OpenAI provider even without custom config', async () => {
+        expect((await threadParamsFor('gpt-6-sol', emptyCodexModelDiscovery())).params.modelProvider).toBe('openai');
       });
 
       it('skips the OpenAI sign-in gate only for custom providers', async () => {
