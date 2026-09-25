@@ -33,7 +33,7 @@ export { classifyUpdateError, categorizeDownloadDuration, isWindowsRenameLockErr
 const REMINDER_SUPPRESSION_DURATION_MS = 24 * 60 * 60 * 1000;
 const GITHUB_UPDATE_PROVIDER = {
   provider: 'github' as const,
-  owner: 'nimbalyst',
+  owner: 'm413w4r3',
   repo: 'nimbalyst'
 };
 

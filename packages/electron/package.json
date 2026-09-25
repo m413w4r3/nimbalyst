@@ -193,7 +193,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "nimbalyst",
+        "owner": "m413w4r3",
         "repo": "nimbalyst",
         "releaseType": "release"
       }
