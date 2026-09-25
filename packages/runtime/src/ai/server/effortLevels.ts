@@ -98,8 +98,9 @@ export function clampEffortLevel(
   modelId?: string,
   supportedLevels?: readonly EffortLevel[],
 ): EffortLevel {
-  if (supportedLevels && supportedLevels.length > 0) {
-    if (supportedLevels.includes(level)) {
+  if (supportedLevels) {
+    // No declared level: nothing to clamp to, and callers send no effort at all.
+    if (supportedLevels.length === 0 || supportedLevels.includes(level)) {
       return level;
     }
     const sorted = [...supportedLevels].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
@@ -113,13 +114,13 @@ export function clampEffortLevel(
 /**
  * The effort levels to offer for a model, for the composer's effort selector.
  * An exact `supportedLevels` set from the model's catalog wins over the
- * static per-model ceiling.
+ * static per-model ceiling; an empty set offers nothing.
  */
 export function getAvailableEffortLevels(
   modelId?: string,
   supportedLevels?: readonly EffortLevel[],
 ): { key: EffortLevel; label: string }[] {
-  if (supportedLevels && supportedLevels.length > 0) {
+  if (supportedLevels) {
     return EFFORT_LEVELS.filter((entry) => supportedLevels.includes(entry.key));
   }
   const ceiling = resolveEffortCeiling(modelId);

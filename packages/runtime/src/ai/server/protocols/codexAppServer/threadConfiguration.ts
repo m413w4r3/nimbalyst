@@ -3,23 +3,38 @@ import type { ThreadStartParams } from './types';
 import { resolveCodexPermissionProfile } from '../codexPermissionProfile';
 import { clampEffortLevel, parseEffortLevel, type EffortLevel } from '../../effortLevels';
 
+/**
+ * The reasoning effort a Codex thread runs at, or null when the model's
+ * catalog declares no selectable level (an empty set is authoritative).
+ * Clamps to what this model accepts: an exact catalog set when one is
+ * declared, else the static ceiling (gpt-5.4/5.5 stop at xhigh, the Luna
+ * tiers at max, and only Astra/Sol/Terra reach ultra).
+ */
+export function resolveCodexReasoningEffort(
+  requested: string | undefined,
+  model: string | undefined,
+  supportedEffortLevels?: EffortLevel[],
+  defaultEffortLevel?: EffortLevel,
+): EffortLevel | null {
+  if (supportedEffortLevels?.length === 0) {
+    return null;
+  }
+  return clampEffortLevel(parseEffortLevel(requested ?? defaultEffortLevel ?? 'high'), model, supportedEffortLevels);
+}
+
 export function buildCodexThreadStartParams(options: SessionOptions): ThreadStartParams {
   const permissionProfile = resolveCodexPermissionProfile(
     options.permissionMode,
     options.raw?.agentVerified === true,
   );
 
-  const effortLevel = options.raw?.effortLevel as string | undefined;
-  // A custom model catalog (config.toml `model_catalog_json`) declares the
+  // A custom model catalog (a profile's `model_catalog_json`) declares the
   // model's exact levels and default; the host resolves them per model.
-  const supportedEffortLevels = options.raw?.codexSupportedEffortLevels as EffortLevel[] | undefined;
-  const defaultEffortLevel = options.raw?.codexDefaultEffortLevel as EffortLevel | undefined;
-  // Clamp to what this model's catalog entry accepts: gpt-5.4/5.5 stop at
-  // xhigh, the Luna tiers at max, and only Astra/Sol/Terra reach ultra.
-  const reasoningEffortRaw = clampEffortLevel(
-    parseEffortLevel(effortLevel ?? defaultEffortLevel ?? 'high'),
+  const reasoningEffort = resolveCodexReasoningEffort(
+    options.raw?.effortLevel as string | undefined,
     options.model ?? undefined,
-    supportedEffortLevels,
+    options.raw?.codexSupportedEffortLevels as EffortLevel[] | undefined,
+    options.raw?.codexDefaultEffortLevel as EffortLevel | undefined,
   );
 
   const systemPrompt = (options.raw?.systemPrompt as string | undefined) ?? options.systemPrompt;
@@ -37,8 +52,11 @@ export function buildCodexThreadStartParams(options: SessionOptions): ThreadStar
     ...(options.raw?.codexConfigOverrides as Record<string, unknown> | undefined ?? {}),
     // Reasoning effort always sets; the host's override map may also set it
     // but a literal here is fine since codex resolves these later.
-    model_reasoning_effort: reasoningEffortRaw,
+    model_reasoning_effort: reasoningEffort,
   };
+  if (reasoningEffort === null) {
+    delete config.model_reasoning_effort;
+  }
 
   // Pin the provider the host resolved for this model so it never inherits an
   // unrelated global `model_provider` from config.toml.

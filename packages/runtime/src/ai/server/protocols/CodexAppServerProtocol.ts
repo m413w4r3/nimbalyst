@@ -31,6 +31,7 @@ import { previewForLog, summarizeNotificationParams, extractNotificationRouting 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
+import { codexProfileLaunchArgs, type CodexCustomModel } from '../providers/codex/codexConfigModels';
 import { describeCodexConfigError } from './codexConfigError';
 import { reverseCodexPatch, type CodexPatchKind } from '../providers/codex/patchReverse';
 import {
@@ -488,7 +489,10 @@ export class CodexAppServerProtocol implements AgentProtocol {
     //   cwd,
     //   helperPathEntries: getCodexVendorPathEntries(binary),
     // });
-    const child = spawn(binary, [...(tracking?.args ?? []), 'app-server', '--listen', 'stdio://'], {
+    // A profile-backed custom model layers its profile's model metadata on
+    // this child; built-in OpenAI models launch plain app-server.
+    const profileArgs = codexProfileLaunchArgs(options.raw?.codexProfile as CodexCustomModel | undefined);
+    const child = spawn(binary, [...(tracking?.args ?? []), 'app-server', ...profileArgs, '--listen', 'stdio://'], {
       env,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],

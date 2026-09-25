@@ -10,12 +10,7 @@ import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 import { buildCodexThreadStartParams } from '../../protocols/codexAppServer/threadConfiguration';
-import {
-  parseCodexConfigModels,
-  parseCodexModelCatalog,
-  readCodexModelCatalog,
-  resolveCodexModelCatalogPath,
-} from '../codex/codexConfigModels';
+import { emptyCodexModelDiscovery, type CodexCustomModel, type CodexModelDiscovery } from '../codex/codexConfigModels';
 
 // getModels() cross-checks the OpenAI model catalogue whenever it is given an
 // API key. Unmocked, that is a real api.openai.com request from the unit suite:
@@ -27,29 +22,33 @@ vi.mock('openai', () => ({
   },
 }));
 
-// getModels() also reads the developer's real ~/.codex/config.toml; keep the
-// roster hermetic. Tests that exercise it inject `readCodexConfig`.
+// getModels() and sendMessage() also read the developer's real Codex home;
+// keep them hermetic. Tests that exercise it inject `discoverCodexModels`.
 vi.mock('../codex/codexConfigModels', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../codex/codexConfigModels')>()),
-  readCodexConfigToml: async () => null,
+  discoverCodexModels: async () => ({ models: [], baseCatalog: new Map(), pinsOpenAIProvider: false }),
 }));
 
-// Shape of a DeepSeek Codex models.json entry; extra keys stand in for the
-// fields the parser must drop.
-const deepseekLevels = [
-  { effort: 'low', description: 'Fast responses' },
-  { effort: 'high', description: 'Deep reasoning' },
-  { effort: 'max', description: 'Maximum reasoning' },
-];
-const deepseekCatalogJson = JSON.stringify({
-  models: ['deepseek-flash', 'deepseek-v4-pro'].map((slug) => ({
-    slug,
-    display_name: slug,
-    base_instructions: 'You are Codex',
-    experimental_bearer_token: 'sk-catalog-SECRET',
-    default_reasoning_level: 'high',
-    supported_reasoning_levels: deepseekLevels,
-  })),
+// What discovery yields for a profile-v2 Codex home (see codexConfigModels.test.ts).
+const deepseekModel: CodexCustomModel = {
+  model: 'deepseek-flash',
+  provider: 'deepseek',
+  profile: 'deepseek-flash',
+  catalogPath: '/home/u/.codex/models.json',
+  supportedEffortLevels: ['low', 'high', 'max'],
+  defaultEffortLevel: 'high',
+};
+const qwenModel: CodexCustomModel = {
+  model: 'Qwen3-Coder-30B-A3B-Instruct-ovh',
+  provider: 'chaps_qwen',
+  profile: 'qwen-worker',
+  catalogPath: '/home/u/.codex/qwen-model-catalog.json',
+  supportedEffortLevels: [],
+};
+const profileDiscovery = (): CodexModelDiscovery => ({
+  models: [deepseekModel, qwenModel, { model: 'my-local-model', provider: 'local-llm' }],
+  baseCatalog: new Map(),
+  pinsOpenAIProvider: true,
 });
 
 function createAsyncEventStream(events: any[]): AsyncIterable<any> {
@@ -316,101 +315,28 @@ describe('OpenAICodexProvider', () => {
     );
   });
 
-  it('appends custom-provider models from config.toml after the unchanged catalog', async () => {
-    const catalog = await OpenAICodexProvider.getModels(undefined, {
-      loadSdkModule: async () => {
-        throw new Error('sdk unavailable');
-      },
-    });
+  it('appends profile models after the unchanged catalog with their own effort levels', async () => {
+    const loadSdkModule = async (): Promise<never> => {
+      throw new Error('sdk unavailable');
+    };
+    const catalog = await OpenAICodexProvider.getModels(undefined, { loadSdkModule });
     const models = await OpenAICodexProvider.getModels(undefined, {
-      loadSdkModule: async () => {
-        throw new Error('sdk unavailable');
-      },
-      readCodexConfig: async () => [
-        'model = "deepseek-flash" # default',
-        'model_provider = "deepseek"',
-        '[model_providers.deepseek]',
-        'model = "not-a-model"',
-        'experimental_bearer_token = "secret"',
-        '[profiles.pro]',
-        "model = 'deepseek-v4-pro'",
-        '[profiles.gpt]',
-        'model = "gpt-5.5"',
-      ].join('\n'),
+      loadSdkModule,
+      discoverCodexModels: async () => profileDiscovery(),
     });
 
     expect(models.map((model) => model.id)).toEqual([
       ...catalog.map((model) => model.id),
       'openai-codex:deepseek-flash',
-      'openai-codex:deepseek-v4-pro',
+      'openai-codex:Qwen3-Coder-30B-A3B-Instruct-ovh',
+      'openai-codex:my-local-model',
     ]);
-  });
-
-  it('attaches catalog effort levels to catalog models and leaves built-in GPT models on the static ceilings', async () => {
-    const models = await OpenAICodexProvider.getModels(undefined, {
-      loadSdkModule: async () => {
-        throw new Error('sdk unavailable');
-      },
-      readCodexConfig: async () => 'model = "deepseek-flash"\nmodel_provider = "deepseek"\n[profiles.pro]\nmodel = "deepseek-v4-pro"\n',
-      readCodexModelCatalog: async () => parseCodexModelCatalog(deepseekCatalogJson),
-    });
     const byId = new Map(models.map((model) => [model.id, model]));
-    for (const id of ['openai-codex:deepseek-flash', 'openai-codex:deepseek-v4-pro']) {
-      expect(byId.get(id)?.supportedEffortLevels).toEqual(['low', 'high', 'max']);
-      expect(byId.get(id)?.defaultEffortLevel).toBe('high');
-    }
+    expect(byId.get('openai-codex:deepseek-flash')).toMatchObject({ supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' });
+    // An empty catalog list is authoritative, not a gap to fill with the xhigh fallback.
+    expect(byId.get('openai-codex:Qwen3-Coder-30B-A3B-Instruct-ovh')?.supportedEffortLevels).toEqual([]);
     expect(byId.get('openai-codex:gpt-6-sol')?.supportedEffortLevels).toBeUndefined();
-    expect(JSON.stringify(models)).not.toContain('SECRET');
-  });
-
-  describe('model_catalog_json', () => {
-    it('keeps only effort capabilities and drops unknown or malformed entries', () => {
-      const catalog = parseCodexModelCatalog(deepseekCatalogJson);
-      expect([...catalog.entries()]).toEqual([
-        ['deepseek-flash', { supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' }],
-        ['deepseek-v4-pro', { supportedEffortLevels: ['low', 'high', 'max'], defaultEffortLevel: 'high' }],
-      ]);
-      expect(parseCodexModelCatalog('not json').size).toBe(0);
-      expect(parseCodexModelCatalog('{"models":{}}').size).toBe(0);
-      // A model with no level Nimbalyst can name keeps the static fallback.
-      expect(parseCodexModelCatalog(JSON.stringify({
-        models: [{ slug: 'odd', supported_reasoning_levels: [{ effort: 'none' }], default_reasoning_level: 'none' }],
-      })).size).toBe(0);
-    });
-
-    it('resolves the catalog path config.toml names, with ~ and relative paths', () => {
-      const home = '/home/u';
-      const codexHome = '/custom/codex';
-      expect(resolveCodexModelCatalogPath('model_catalog_json = "~/.codex/models.json"\n', codexHome, home))
-        .toBe('/home/u/.codex/models.json');
-      expect(resolveCodexModelCatalogPath("model_catalog_json = 'catalogs/ds.json'\n", codexHome, home))
-        .toBe('/custom/codex/catalogs/ds.json');
-      expect(resolveCodexModelCatalogPath('model_catalog_json = "/etc/models.json"\n', codexHome, home))
-        .toBe('/etc/models.json');
-      // Only the top-level key counts; a table's key of the same name is someone else's.
-      expect(resolveCodexModelCatalogPath('model = "x"\n[profiles.p]\nmodel_catalog_json = "/p.json"\n', codexHome, home))
-        .toBeNull();
-    });
-
-    it('reads the catalog from CODEX_HOME and falls back to empty when it is missing or invalid', async () => {
-      const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-catalog-'));
-      const previous = process.env.CODEX_HOME;
-      process.env.CODEX_HOME = codexHome;
-      try {
-        await fs.writeFile(path.join(codexHome, 'models.json'), deepseekCatalogJson);
-        await fs.writeFile(path.join(codexHome, 'bad.json'), '{');
-        expect((await readCodexModelCatalog('model_catalog_json = "models.json"\n')).get('deepseek-flash')?.supportedEffortLevels)
-          .toEqual(['low', 'high', 'max']);
-        expect((await readCodexModelCatalog('model_catalog_json = "missing.json"\n')).size).toBe(0);
-        expect((await readCodexModelCatalog('model_catalog_json = "bad.json"\n')).size).toBe(0);
-        expect((await readCodexModelCatalog('model = "deepseek-flash"\n')).size).toBe(0);
-        expect((await readCodexModelCatalog(null)).size).toBe(0);
-      } finally {
-        if (previous === undefined) delete process.env.CODEX_HOME;
-        else process.env.CODEX_HOME = previous;
-        await fs.rm(codexHome, { recursive: true, force: true });
-      }
-    });
+    expect(JSON.stringify(models)).not.toContain('catalogPath');
   });
 
   it('leaves custom-provider model ids untouched when normalizing', () => {
@@ -2152,102 +2078,107 @@ describe('OpenAICodexProvider', () => {
       expect(createSession).toHaveBeenCalledTimes(1);
     });
 
-    describe('model_provider pinning', () => {
-      const secret = 'sk-deepseek-SECRET';
-      const deepseekConfig = [
-        'model = "deepseek-flash"',
-        'model_provider = "deepseek"',
-        '[model_providers.deepseek]',
-        'base_url = "https://api.deepseek.com/v1"',
-        'env_key = "DEEPSEEK_API_KEY"',
-        `experimental_bearer_token = "${secret}"`,
-        '[profiles.deepseek-v4-pro]',
-        'model = "deepseek-v4-pro"',
-        'model_provider = "deepseek"',
-        `api_key = "${secret}"`,
-        '[profiles.local]',
-        'model = "my-local-model"',
-        'model_provider = "local-llm"',
-      ].join('\n');
-
-      async function threadParamsFor(
-        model: string,
-        toml: string | null,
-        opts: { catalogJson?: string; effortLevel?: string } = {},
-      ) {
+    describe('custom model profiles', () => {
+      function createProvider(discovery: CodexModelDiscovery) {
         OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
-        const createSession = vi.fn(async () => ({ id: 'thread-provider', platform: 'codex-app-server', raw: {} }));
+        let thread = 0;
+        const createSession = vi.fn(async () => ({ id: `thread-${++thread}`, platform: 'codex-app-server', raw: {} }));
+        const resumeSession = vi.fn(async (id: string) => ({ id, platform: 'codex-app-server', raw: {} }));
+        const cleanupSession = vi.fn();
         const provider = new OpenAICodexProvider({}, {
           transport: 'app-server',
-          readCodexConfig: async () => toml,
-          readCodexModelCatalog: async () => parseCodexModelCatalog(opts.catalogJson ?? ''),
+          discoverCodexModels: async () => discovery,
           protocol: {
             platform: 'codex-app-server',
             createSession,
-            resumeSession: vi.fn(),
+            resumeSession,
             forkSession: vi.fn(),
             sendMessage: vi.fn(() => createAsyncEventStream([])),
             abortSession: vi.fn(),
-            cleanupSession: vi.fn(),
+            cleanupSession,
           } as any,
         });
-        await provider.initialize({
-          model: `openai-codex:${model}`,
-          ...(opts.effortLevel ? { effortLevel: opts.effortLevel as any } : {}),
-        });
-        for await (const _chunk of provider.sendMessage('hi', undefined, `session-${model}`, [], process.cwd())) {
-          // drain
-        }
-        return buildCodexThreadStartParams((createSession.mock.calls[0] as any[])[0]);
+        const turn = async (model: string, effortLevel?: string, sessionId = 'session-profile') => {
+          await provider.initialize({ model: `openai-codex:${model}`, ...(effortLevel ? { effortLevel: effortLevel as any } : {}) });
+          for await (const _chunk of provider.sendMessage('hi', undefined, sessionId, [], process.cwd())) {
+            // drain
+          }
+        };
+        return { provider, turn, createSession, resumeSession, cleanupSession };
+      }
+
+      async function threadParamsFor(model: string, discovery: CodexModelDiscovery, effortLevel?: string) {
+        const { turn, createSession } = createProvider(discovery);
+        await turn(model, effortLevel, `session-${model}`);
+        const options = (createSession.mock.calls[0] as any[])[0];
+        return { options, params: buildCodexThreadStartParams(options) };
       }
 
       it.each([
-        ['deepseek-flash', 'deepseek'],
-        ['deepseek-v4-pro', 'deepseek'],
-        ['my-local-model', 'local-llm'],
-        ['gpt-6-luna', 'openai'],
-        ['gpt-6-sol', 'openai'],
-      ])('starts %s with model_provider=%s despite a global deepseek provider', async (model, expected) => {
-        const params = await threadParamsFor(model, deepseekConfig);
+        ['deepseek-flash', 'deepseek', 'deepseek-flash'],
+        ['Qwen3-Coder-30B-A3B-Instruct-ovh', 'chaps_qwen', 'qwen-worker'],
+        ['my-local-model', 'local-llm', undefined],
+        ['gpt-6-luna', 'openai', undefined],
+        ['gpt-6-sol', 'openai', undefined],
+      ])('starts %s on provider %s with profile %s', async (model, provider, profile) => {
+        const { options, params } = await threadParamsFor(model, profileDiscovery());
         expect(params.model).toBe(model);
-        expect(params.modelProvider).toBe(expected);
+        expect(params.modelProvider).toBe(provider);
+        expect(options.raw.codexProfile?.profile).toBe(profile);
+        expect(JSON.stringify(options.raw)).not.toMatch(/API_KEY|SECRET/);
       });
 
-      it('sends catalog effort levels to Codex unchanged and clamps to the exact set', async () => {
-        const catalogJson = deepseekCatalogJson;
-        const effortFor = async (effortLevel?: string) =>
-          (await threadParamsFor('deepseek-flash', deepseekConfig, { catalogJson, effortLevel })).config?.model_reasoning_effort;
-        expect(await effortFor('max')).toBe('max');
-        expect(await effortFor('low')).toBe('low');
+      it('clamps to the catalog set, defaults to its level, and sends no effort for a model with none', async () => {
+        const effortFor = async (model: string, effortLevel?: string) =>
+          (await threadParamsFor(model, profileDiscovery(), effortLevel)).params.config;
+        expect((await effortFor('deepseek-flash', 'max'))?.model_reasoning_effort).toBe('max');
         // xhigh is not a distinct DeepSeek level; it lands on high, never on max.
-        expect(await effortFor('xhigh')).toBe('high');
-        expect(await effortFor('ultra')).toBe('max');
-        // No effort preference at all: the catalog's default_reasoning_level.
-        expect(await effortFor(undefined)).toBe('high');
-        // Without a catalog the existing static fallback is untouched: xhigh passes through.
-        expect((await threadParamsFor('deepseek-flash', deepseekConfig, { effortLevel: 'xhigh' })).config?.model_reasoning_effort)
-          .toBe('xhigh');
-        // A built-in model absent from the catalog keeps its static ceiling.
-        expect((await threadParamsFor('gpt-6-sol', deepseekConfig, { catalogJson, effortLevel: 'ultra' })).config?.model_reasoning_effort)
-          .toBe('ultra');
+        expect((await effortFor('deepseek-flash', 'xhigh'))?.model_reasoning_effort).toBe('high');
+        expect((await effortFor('deepseek-flash'))?.model_reasoning_effort).toBe('high');
+        expect(await effortFor('Qwen3-Coder-30B-A3B-Instruct-ovh', 'xhigh')).not.toHaveProperty('model_reasoning_effort');
+        expect((await effortFor('gpt-6-sol', 'ultra'))?.model_reasoning_effort).toBe('ultra');
       });
 
-      it('leaves the provider to Codex when config.toml configures none', async () => {
-        expect((await threadParamsFor('gpt-6-sol', null)).modelProvider).toBeUndefined();
-        expect((await threadParamsFor('gpt-6-sol', 'model = "gpt-6-sol"\n')).modelProvider).toBeUndefined();
+      it('leaves the provider to Codex when nothing custom is configured', async () => {
+        expect((await threadParamsFor('gpt-6-sol', emptyCodexModelDiscovery())).params.modelProvider).toBeUndefined();
       });
 
-      it('parses only model/provider pairs, never credentials', () => {
-        const models = parseCodexConfigModels(deepseekConfig);
-        expect(models).toEqual([
-          { model: 'deepseek-flash', provider: 'deepseek' },
-          { model: 'deepseek-v4-pro', provider: 'deepseek' },
-          { model: 'my-local-model', provider: 'local-llm' },
-        ]);
-        expect(JSON.stringify(models)).not.toContain(secret);
-        // A profile without its own model_provider inherits the top-level one, as in Codex.
-        expect(parseCodexConfigModels('model_provider = "deepseek"\n[profiles.x]\nmodel = "deepseek-chat"\n'))
-          .toEqual([{ model: 'deepseek-chat', provider: 'deepseek' }]);
+      it('skips the OpenAI sign-in gate only for custom providers', async () => {
+        const gate = vi.fn(async () => ({ requiresOpenaiAuth: true }));
+        const { turn, createSession } = createProvider(profileDiscovery());
+        OpenAICodexProvider.setCodexAuthGate(gate);
+        await turn('deepseek-flash', undefined, 'session-ds');
+        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(gate).not.toHaveBeenCalled();
+        await turn('gpt-6-luna', undefined, 'session-gpt');
+        expect(gate).toHaveBeenCalledTimes(1);
+        expect(createSession).toHaveBeenCalledTimes(1);
+      });
+
+      it('reuses the live child only while model, provider, profile and effort are unchanged', async () => {
+        const { turn, createSession, resumeSession, cleanupSession } = createProvider(profileDiscovery());
+        await turn('deepseek-flash', 'high');
+        await turn('deepseek-flash', 'high');
+        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(resumeSession).not.toHaveBeenCalled();
+
+        const switches: Array<[string, string, string | undefined, string | null]> = [
+          ['deepseek-flash', 'max', 'deepseek', 'max'],
+          ['gpt-6-luna', 'max', 'openai', 'max'],
+          ['deepseek-flash', 'max', 'deepseek', 'max'],
+          ['Qwen3-Coder-30B-A3B-Instruct-ovh', 'max', 'chaps_qwen', null],
+        ];
+        for (const [index, [model, effort, provider, sentEffort]] of switches.entries()) {
+          await turn(model, effort);
+          expect(cleanupSession).toHaveBeenCalledTimes(index + 1);
+          expect(resumeSession).toHaveBeenCalledTimes(index + 1);
+          const [threadId, options] = resumeSession.mock.calls[index] as any[];
+          expect(threadId).toBe('thread-1');
+          const params = buildCodexThreadStartParams(options);
+          expect([params.model, params.modelProvider, params.config?.model_reasoning_effort ?? null])
+            .toEqual([model, provider, sentEffort]);
+        }
+        expect(createSession).toHaveBeenCalledTimes(1);
       });
     });
 

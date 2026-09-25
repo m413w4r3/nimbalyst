@@ -19,7 +19,8 @@ export function collectModelEffortLevels(
   const result: Record<string, EffortLevel[]> = {};
   for (const models of Object.values(grouped)) {
     for (const model of models) {
-      if (Array.isArray(model.supportedEffortLevels) && model.supportedEffortLevels.length > 0) {
+      // An empty array is kept: the model declares no selectable level.
+      if (Array.isArray(model.supportedEffortLevels)) {
         result[model.id] = model.supportedEffortLevels;
       }
     }

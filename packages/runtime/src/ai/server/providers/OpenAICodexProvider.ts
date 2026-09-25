@@ -30,12 +30,12 @@ import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
 import {
-  parseCodexConfigModelIds,
-  readCodexConfigToml,
-  readCodexModelCatalog,
-  resolveCodexModelProvider,
-  type CodexModelCatalog,
+  CODEX_OPENAI_MODEL_PROVIDER,
+  discoverCodexModels,
+  resolveCodexModel,
+  type CodexModelDiscovery,
 } from './codex/codexConfigModels';
+import { resolveCodexReasoningEffort } from '../protocols/codexAppServer/threadConfiguration';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
 import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
@@ -86,16 +86,13 @@ interface OpenAICodexProviderDeps {
   idleProtocolSessionTimeoutMs?: number;
   /** Injectable scheduler keeps lifecycle tests deterministic without global fake timers. */
   idleProtocolSessionScheduler?: ProtocolSessionIdleScheduler;
-  /** Codex config.toml reader; defaults to the user's real file. */
-  readCodexConfig?: () => Promise<string | null>;
-  /** Reader for the `model_catalog_json` config.toml names; defaults to the real file. */
-  readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
+  /** Custom models from the Codex home; defaults to the user's real `CODEX_HOME`. */
+  discoverCodexModels?: () => Promise<CodexModelDiscovery>;
 }
 
 interface OpenAICodexModelDiscoveryDeps {
   loadSdkModule?: () => Promise<CodexSdkModuleLike>;
-  readCodexConfig?: () => Promise<string | null>;
-  readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
+  discoverCodexModels?: () => Promise<CodexModelDiscovery>;
 }
 
 interface PendingAskUserQuestionEntry {
@@ -185,8 +182,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   private readonly protocol: CodexProtocol;
   private readonly transport: CodexTransport;
-  private readonly readCodexConfig?: () => Promise<string | null>;
-  private readonly readCodexModelCatalog?: (toml: string | null) => Promise<CodexModelCatalog>;
+  private readonly discoverCodexModels?: () => Promise<CodexModelDiscovery>;
   private readonly permissionService: ToolPermissionService;
   private readonly mcpConfigService: McpConfigService;
   private readonly pendingAskUserQuestions = new Map<string, PendingAskUserQuestionEntry>();
@@ -371,8 +367,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       clearTimeout: (handle) => clearTimeout(handle),
     };
 
-    this.readCodexConfig = deps?.readCodexConfig;
-    this.readCodexModelCatalog = deps?.readCodexModelCatalog;
+    this.discoverCodexModels = deps?.discoverCodexModels;
 
     // Resolve transport: explicit dep > registered resolver > SDK-specific test
     // deps > default 'app-server'.
@@ -593,50 +588,40 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   }
 
   /**
-   * Append models the user declared in Codex's config.toml that the curated
-   * catalog does not already cover -- the only way a custom `model_providers`
-   * model reaches the picker. The catalog filter still applies to SDK/API
-   * discovery; these ids come from the user's own Codex configuration.
-   * Models the `model_catalog_json` catalog declares carry its exact effort
-   * levels, so the selector offers what Codex will accept for them.
+   * Append models the user declared in their Codex home (profile-v2 files,
+   * then legacy config.toml) that the curated catalog does not already cover
+   * -- the only way a custom `model_providers` model reaches the picker. The
+   * catalog filter still applies to SDK/API discovery. Each model carries the
+   * effort levels its own `model_catalog_json` declares, so the selector
+   * offers what Codex will accept for it.
    */
   private static async appendCodexConfigModels(
     models: AIModel[],
     deps?: OpenAICodexModelDiscoveryDeps,
   ): Promise<AIModel[]> {
-    const toml = await (deps?.readCodexConfig ?? readCodexConfigToml)();
-    if (!toml) {
-      return models;
-    }
-    const catalog = await (deps?.readCodexModelCatalog ?? readCodexModelCatalog)(toml);
-    return OpenAICodexProvider.withCatalogEffortLevels(
-      OpenAICodexProvider.appendConfigModelIds(models, toml),
-      catalog,
-    );
-  }
-
-  private static withCatalogEffortLevels(models: AIModel[], catalog: CodexModelCatalog): AIModel[] {
-    if (catalog.size === 0) {
-      return models;
-    }
-    return models.map((model) => {
-      const rawId = OpenAICodexProvider.toRawModelId(model.id);
-      const info = rawId ? catalog.get(rawId) : undefined;
-      return info ? { ...model, ...info } : model;
-    });
-  }
-
-  private static appendConfigModelIds(models: AIModel[], toml: string): AIModel[] {
+    const discovery = await (deps?.discoverCodexModels ?? discoverCodexModels)();
     const seen = new Set(models.map((model) => OpenAICodexProvider.toRawModelId(model.id)));
-    const extra = OpenAICodexProvider.mapSdkModelResult(parseCodexConfigModelIds(toml)).filter((model) => {
+    const declared = OpenAICodexProvider.mapSdkModelResult(discovery.models.map((entry) => entry.model))
+      .filter((model) => {
+        const rawId = OpenAICodexProvider.toRawModelId(model.id);
+        if (seen.has(rawId)) {
+          return false;
+        }
+        seen.add(rawId);
+        return true;
+      });
+    return [...models, ...declared].map((model) => {
       const rawId = OpenAICodexProvider.toRawModelId(model.id);
-      if (seen.has(rawId)) {
-        return false;
+      const resolved = rawId ? resolveCodexModel(discovery, rawId) : undefined;
+      if (!resolved?.supportedEffortLevels) {
+        return model;
       }
-      seen.add(rawId);
-      return true;
+      return {
+        ...model,
+        supportedEffortLevels: resolved.supportedEffortLevels,
+        ...(resolved.defaultEffortLevel ? { defaultEffortLevel: resolved.defaultEffortLevel } : {}),
+      };
     });
-    return [...models, ...extra];
   }
 
   private static getFallbackModels() {
@@ -1150,7 +1135,26 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         ? OpenAICodexProvider.additionalDirectoriesLoader(workspacePath)
         : [];
 
-      const permissionKey = codexSessionConfigurationKey(permissionDecision.permissionMode, permissionDecision.agentVerified === true, workspacePath, additionalDirectories);
+      // The child and thread are bound to one model, provider, profile and
+      // effort, so any change reattaches instead of reusing a live child.
+      const resolvedModel = await this.getConfiguredModel();
+      const codexModel = resolveCodexModel(
+        await (this.discoverCodexModels ?? discoverCodexModels)(),
+        resolvedModel,
+      );
+      const reasoningEffort = resolveCodexReasoningEffort(
+        this.config?.effortLevel,
+        resolvedModel,
+        codexModel.supportedEffortLevels,
+        codexModel.defaultEffortLevel,
+      );
+      const permissionKey = JSON.stringify([
+        codexSessionConfigurationKey(permissionDecision.permissionMode, permissionDecision.agentVerified === true, workspacePath, additionalDirectories),
+        resolvedModel,
+        codexModel.provider ?? null,
+        codexModel.profile ?? null,
+        reasoningEffort,
+      ]);
       let cachedLiveSession = sessionId ? this.liveProtocolSessions.get(sessionId) : undefined;
       if (
         sessionId &&
@@ -1210,14 +1214,6 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         // console.log('[CODEX] Pre-edit hook env configured:', { sessionId, sidecarDir });
       }
 
-      const resolvedModel = await this.getConfiguredModel();
-      const codexConfigToml = await (this.readCodexConfig ?? readCodexConfigToml)();
-      const codexModelProvider = resolveCodexModelProvider(codexConfigToml, resolvedModel);
-      // Exact effort levels the custom model catalog declares, so the thread
-      // clamps to them instead of the static per-model ceiling.
-      const catalogEffort = (await (this.readCodexModelCatalog ?? readCodexModelCatalog)(codexConfigToml))
-        .get(resolvedModel);
-
       const sessionOptions = {
         workspacePath,
         model: resolvedModel,
@@ -1233,11 +1229,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
           abortSignal: abortController.signal,
           agentVerified: permissionDecision.agentVerified === true,
           codexConfigOverrides: this.buildCodexConfigOverrides(mcpServers),
-          ...(codexModelProvider ? { codexModelProvider } : {}),
-          ...(catalogEffort ? {
-            codexSupportedEffortLevels: catalogEffort.supportedEffortLevels,
-            ...(catalogEffort.defaultEffortLevel ? { codexDefaultEffortLevel: catalogEffort.defaultEffortLevel } : {}),
-          } : {}),
+          ...(codexModel.provider ? { codexModelProvider: codexModel.provider } : {}),
+          ...(codexModel.profile ? { codexProfile: codexModel } : {}),
+          // Exact effort levels the model's catalog declares, so the thread
+          // clamps to them instead of the static per-model ceiling.
+          ...(codexModel.supportedEffortLevels ? { codexSupportedEffortLevels: codexModel.supportedEffortLevels } : {}),
+          ...(codexModel.defaultEffortLevel ? { codexDefaultEffortLevel: codexModel.defaultEffortLevel } : {}),
           ...(codexEnv ? { codexEnv } : {}),
           ...(this.config?.effortLevel ? { effortLevel: this.config.effortLevel } : {}),
           ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
@@ -1254,6 +1251,8 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       if (
         this.transport === 'app-server' &&
         !cachedLiveSession &&
+        // A custom provider authenticates with its own Codex `env_key`.
+        (codexModel.provider ?? CODEX_OPENAI_MODEL_PROVIDER) === CODEX_OPENAI_MODEL_PROVIDER &&
         OpenAICodexProvider.codexAuthGate
       ) {
         try {

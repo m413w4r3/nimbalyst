@@ -67,4 +67,17 @@ describe('effort selector with catalog-declared levels', () => {
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Max' }));
     expect(onLevelChange).toHaveBeenCalledWith('max');
   });
+
+  it('hides the selector for a model whose catalog declares no levels', () => {
+    const store = createStore();
+    store.set(modelEffortLevelsAtom, collectModelEffortLevels({
+      'openai-codex': [{ id: 'openai-codex:qwen', supportedEffortLevels: [] }],
+    }));
+    render(
+      <Provider store={store}>
+        <EffortLevelSelector level="high" modelId="openai-codex:qwen" onLevelChange={vi.fn()} />
+      </Provider>
+    );
+    expect(screen.queryByTestId('effort-level-selector')).toBeNull();
+  });
 });

@@ -52,6 +52,11 @@ export function EffortLevelSelector({ open, onOpenChange, level, onLevelChange, 
     options[(index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length]?.focus();
   };
 
+  // A model whose catalog declares no reasoning level has nothing to select.
+  if (availableLevels.length === 0) {
+    return null;
+  }
+
   return (
     <div className="effort-level-selector relative inline-block">
       <button

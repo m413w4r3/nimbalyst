@@ -241,6 +241,23 @@ describe('CodexAppServerProtocol', () => {
     protocol.cleanupSession(session);
   });
 
+  it.each([
+    ['DeepSeek', { model: 'deepseek-flash', provider: 'deepseek', profile: 'deepseek-flash', catalogPath: '/h/.codex/models.json' },
+      ['-c', 'model="deepseek-flash"', '-c', 'model_provider="deepseek"', '-c', 'model_catalog_json="/h/.codex/models.json"']],
+    ['Qwen', { model: 'Qwen3-Coder', provider: 'chaps_qwen', profile: 'qwen-worker' },
+      ['-c', 'model="Qwen3-Coder"', '-c', 'model_provider="chaps_qwen"']],
+    ['OpenAI', undefined, []],
+  ])('launches app-server for a %s model with its profile overrides', async (_name, codexProfile, profileArgs) => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws', raw: codexProfile ? { codexProfile } : {} });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: {} });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 'thread-profile' } } });
+    protocol.cleanupSession(await sessionPromise);
+    expect(spawnMock.mock.calls[0][1]).toEqual(['app-server', ...profileArgs, '--listen', 'stdio://']);
+  });
+
   it('uses Codex automatic review for Agent-verified workspaces', async () => {
     const protocol = new CodexAppServerProtocol();
     const sessionPromise = protocol.createSession({

@@ -141,8 +141,14 @@ describe('exact catalog effort levels', () => {
     expect(clampEffortLevel('low', 'm', ['high', 'max'])).toBe('high');
   });
 
-  it('falls back to the static ceiling when no levels are declared', () => {
-    expect(clampEffortLevel('max', 'openai-codex:deepseek-flash', [])).toBe('xhigh');
+  it('falls back to the static ceiling only when no set is declared', () => {
+    expect(clampEffortLevel('max', 'openai-codex:deepseek-flash')).toBe('xhigh');
     expect(getAvailableEffortLevels('openai-codex:deepseek-flash').map((l) => l.key)).not.toContain('max');
+  });
+
+  it('treats an empty declared set as authoritative: nothing to offer', () => {
+    // A Qwen catalog entry declares supported_reasoning_levels = [].
+    expect(getAvailableEffortLevels('openai-codex:qwen', [])).toEqual([]);
+    expect(clampEffortLevel('max', 'openai-codex:qwen', [])).toBe('max');
   });
 });
