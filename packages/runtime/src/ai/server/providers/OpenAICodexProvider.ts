@@ -37,6 +37,13 @@ import {
   type CodexModelDiscoveryOptions,
 } from './codex/codexConfigModels';
 import { logCodexRoute, type CodexRoutingSnapshot } from '../codexRoutingDiagnostics';
+import {
+  codexThreadRoutingOf,
+  createFileCodexThreadRoutingStore,
+  createMemoryCodexThreadRoutingStore,
+  isSameCodexThreadRouting,
+  type CodexThreadRoutingStore,
+} from './codex/codexThreadRouting';
 import { resolveCodexReasoningEffort } from '../protocols/codexAppServer/threadConfiguration';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
@@ -90,6 +97,8 @@ interface OpenAICodexProviderDeps {
   idleProtocolSessionScheduler?: ProtocolSessionIdleScheduler;
   /** Custom models from the Codex home; defaults to the user's real `CODEX_HOME`. */
   discoverCodexModels?: (options?: CodexModelDiscoveryOptions) => Promise<CodexModelDiscovery>;
+  /** Provider/profile each Codex thread was created with; defaults to the static store. */
+  threadRoutingStore?: CodexThreadRoutingStore;
 }
 
 interface OpenAICodexModelDiscoveryDeps {
@@ -185,6 +194,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   private readonly protocol: CodexProtocol;
   private readonly transport: CodexTransport;
   private readonly discoverCodexModels?: () => Promise<CodexModelDiscovery>;
+  private readonly threadRoutingStore?: CodexThreadRoutingStore;
   private readonly permissionService: ToolPermissionService;
   private readonly mcpConfigService: McpConfigService;
   private readonly pendingAskUserQuestions = new Map<string, PendingAskUserQuestionEntry>();
@@ -314,6 +324,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   // item.started to populate pre-edit baselines.
   private static preEditSidecarDirResolver: ((sessionId: string) => string | undefined) | null = null;
 
+  // Provider/profile each persisted Codex thread was created with. Electron
+  // swaps in a file-backed store so the boundary check survives restarts.
+  private static threadRoutingStore: CodexThreadRoutingStore = createMemoryCodexThreadRoutingStore();
+
   // Resolves the active codex transport from settings at provider-construct
   // time. Each new session reads this anew, so a settings change between
   // sessions takes effect on the next session.
@@ -371,6 +385,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     };
 
     this.discoverCodexModels = deps?.discoverCodexModels;
+    this.threadRoutingStore = deps?.threadRoutingStore;
 
     // Resolve transport: explicit dep > registered resolver > SDK-specific test
     // deps > default 'app-server'.
@@ -507,6 +522,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   public static setPreEditSidecarDirResolver(resolver: ((sessionId: string) => string | undefined) | null): void {
     OpenAICodexProvider.preEditSidecarDirResolver = resolver;
+  }
+
+  public static setThreadRoutingFile(filePath: string | null): void {
+    OpenAICodexProvider.threadRoutingStore = filePath
+      ? createFileCodexThreadRoutingStore(filePath)
+      : createMemoryCodexThreadRoutingStore();
   }
 
   async initialize(config: ProviderConfig): Promise<void> {
@@ -1207,7 +1228,34 @@ export class OpenAICodexProvider extends BaseAgentProvider {
         this.evictLiveProtocolSession(sessionId);
         cachedLiveSession = undefined;
       }
-      const existingSessionId = this.sessions.getSessionId(sessionId || '');
+      // A persisted thread's history is bound to the provider/profile that
+      // wrote it; resuming it through another provider is rejected (e.g.
+      // OpenAI refusing a third-party provider's reasoning items). Start a
+      // fresh thread instead. A thread with no record (created before this
+      // check existed) is adopted by the route that next resumes it.
+      const threadRoutingStore = this.threadRoutingStore ?? OpenAICodexProvider.threadRoutingStore;
+      const selectedThreadRouting = codexThreadRoutingOf(routingSnapshot);
+      let existingSessionId = this.sessions.getSessionId(sessionId || '');
+      const persistedThreadRouting = existingSessionId
+        ? threadRoutingStore.get(existingSessionId)
+        : undefined;
+      let startedFreshAtRoutingBoundary = false;
+      if (
+        existingSessionId &&
+        persistedThreadRouting &&
+        !isSameCodexThreadRouting(persistedThreadRouting, selectedThreadRouting)
+      ) {
+        logCodexRoute('new-thread', {
+          reason: 'provider/profile boundary',
+          previous: persistedThreadRouting,
+          next: selectedThreadRouting,
+          discardedThreadId: existingSessionId,
+        });
+        this.evictLiveProtocolSession(sessionId);
+        cachedLiveSession = undefined;
+        existingSessionId = undefined;
+        startedFreshAtRoutingBoundary = true;
+      }
       // console.log('[CODEX] Session lookup:', {
       //   sessionId,
       //   existingSessionId,
@@ -1316,6 +1364,12 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       } else {
         session = await this.protocol.createSession(sessionOptions);
         isResumedThread = false;
+      }
+      if (session.id && !cachedLiveSession) {
+        const recordedRouting = threadRoutingStore.get(session.id);
+        if (!recordedRouting || !isSameCodexThreadRouting(recordedRouting, selectedThreadRouting)) {
+          threadRoutingStore.set(session.id, selectedThreadRouting);
+        }
       }
       // Stash live sessions so future turns on the same Nimbalyst session reuse
       // the same child. Skip when sessionId is absent (anonymous turns -- nothing
@@ -1535,6 +1589,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       if (
         sessionId &&
         !isResumedThread &&
+        !startedFreshAtRoutingBoundary &&
         hasSessionNamingServer &&
         !usedSessionNamingToolThisTurn &&
         !abortController.signal.aborted

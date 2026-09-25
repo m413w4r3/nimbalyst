@@ -11,6 +11,7 @@ import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 import { buildCodexThreadStartParams } from '../../protocols/codexAppServer/threadConfiguration';
 import { emptyCodexModelDiscovery, type CodexCustomModel, type CodexModelDiscovery } from '../codex/codexConfigModels';
+import { createFileCodexThreadRoutingStore, createMemoryCodexThreadRoutingStore, type CodexThreadRoutingStore } from '../codex/codexThreadRouting';
 
 // getModels() cross-checks the OpenAI model catalogue whenever it is given an
 // API key. Unmocked, that is a real api.openai.com request from the unit suite:
@@ -83,6 +84,7 @@ describe('OpenAICodexProvider', () => {
     OpenAICodexProvider.setPreEditHookScriptPathResolver(null);
     OpenAICodexProvider.setPreEditSidecarDirResolver(null);
     OpenAICodexProvider.setCodexTransportResolver(null);
+    OpenAICodexProvider.setThreadRoutingFile(null);
 
     // Provide default injected dependencies required by the provider.
     OpenAICodexProvider.setTrustChecker(() => ({ trusted: true, mode: 'allow-all' as any }));
@@ -2085,15 +2087,20 @@ describe('OpenAICodexProvider', () => {
     });
 
     describe('custom model profiles', () => {
-      function createProvider(discovery: CodexModelDiscovery) {
+      function createProvider(
+        discovery: CodexModelDiscovery,
+        threadRoutingStore: CodexThreadRoutingStore = createMemoryCodexThreadRoutingStore(),
+        threadPrefix = 'thread',
+      ) {
         OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
         let thread = 0;
-        const createSession = vi.fn(async () => ({ id: `thread-${++thread}`, platform: 'codex-app-server', raw: {} }));
+        const createSession = vi.fn(async () => ({ id: `${threadPrefix}-${++thread}`, platform: 'codex-app-server', raw: {} }));
         const resumeSession = vi.fn(async (id: string) => ({ id, platform: 'codex-app-server', raw: {} }));
         const cleanupSession = vi.fn();
         const provider = new OpenAICodexProvider({}, {
           transport: 'app-server',
           discoverCodexModels: async () => discovery,
+          threadRoutingStore,
           protocol: {
             platform: 'codex-app-server',
             createSession,
@@ -2161,30 +2168,95 @@ describe('OpenAICodexProvider', () => {
         expect(createSession).toHaveBeenCalledTimes(1);
       });
 
-      it('reuses the live child only while model, provider, profile and effort are unchanged', async () => {
-        const { turn, createSession, resumeSession, cleanupSession } = createProvider(profileDiscovery());
+      it('resumes the thread across model and effort changes but starts a new one at each provider/profile boundary', async () => {
+        const { provider, turn, createSession, resumeSession, cleanupSession } = createProvider(profileDiscovery());
         await turn('deepseek-flash', 'high');
         await turn('deepseek-flash', 'high');
         expect(createSession).toHaveBeenCalledTimes(1);
         expect(resumeSession).not.toHaveBeenCalled();
 
-        const switches: Array<[string, string, string | undefined, string | null]> = [
-          ['deepseek-flash', 'max', 'deepseek', 'max'],
-          ['gpt-6-luna', 'max', 'openai', 'max'],
-          ['deepseek-flash', 'max', 'deepseek', 'max'],
-          ['Qwen3-Coder-30B-A3B-Instruct-ovh', 'max', 'chaps_qwen', null],
+        // [model, effort, expected action, expected thread, provider, sent effort]
+        const switches: Array<[string, string, 'resume' | 'create', string, string, string | null]> = [
+          ['deepseek-flash', 'max', 'resume', 'thread-1', 'deepseek', 'max'],
+          ['gpt-6-luna', 'max', 'create', 'thread-2', 'openai', 'max'],
+          ['gpt-6-sol', 'max', 'resume', 'thread-2', 'openai', 'max'],
+          ['deepseek-flash', 'max', 'create', 'thread-3', 'deepseek', 'max'],
+          ['Qwen3-Coder-30B-A3B-Instruct-ovh', 'max', 'create', 'thread-4', 'chaps_qwen', null],
+          ['gpt-6-luna', 'high', 'create', 'thread-5', 'openai', 'high'],
         ];
-        for (const [index, [model, effort, provider, sentEffort]] of switches.entries()) {
+        for (const [index, [model, effort, action, threadId, modelProvider, sentEffort]] of switches.entries()) {
+          const calls: any[][] = action === 'resume' ? resumeSession.mock.calls : createSession.mock.calls;
+          const before = calls.length;
           await turn(model, effort);
+          // Every switch drops the live child bound to the previous route.
           expect(cleanupSession).toHaveBeenCalledTimes(index + 1);
-          expect(resumeSession).toHaveBeenCalledTimes(index + 1);
-          const [threadId, options] = resumeSession.mock.calls[index] as any[];
-          expect(threadId).toBe('thread-1');
+          expect(calls).toHaveLength(before + 1);
+          const options = action === 'resume' ? calls[before][1] : calls[before][0];
+          if (action === 'resume') expect(calls[before][0]).toBe(threadId);
+          expect(provider.getProviderSessionData('session-profile').providerSessionId).toBe(threadId);
           const params = buildCodexThreadStartParams(options);
           expect([params.model, params.modelProvider, params.config?.model_reasoning_effort ?? null])
-            .toEqual([model, provider, sentEffort]);
+            .toEqual([model, modelProvider, sentEffort]);
         }
-        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(createSession).toHaveBeenCalledTimes(5);
+        expect(resumeSession).toHaveBeenCalledTimes(2);
+      });
+
+      describe('after a restart', () => {
+        let routingFile: string;
+        beforeEach(async () => {
+          routingFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'codex-thread-routing-')), 'routing.json');
+        });
+
+        // Process 1 creates a thread; process 2 starts with an empty live
+        // cache and only the persisted thread id plus the routing file.
+        async function restartWith(firstModel: string, secondModel: string) {
+          const first = createProvider(profileDiscovery(), createFileCodexThreadRoutingStore(routingFile), 'thread-p1');
+          await first.turn(firstModel, undefined, 'session-restart');
+          const persistedThreadId = first.provider.getProviderSessionData('session-restart').providerSessionId;
+          expect(persistedThreadId).toBe('thread-p1-1');
+
+          const second = createProvider(profileDiscovery(), createFileCodexThreadRoutingStore(routingFile), 'thread-p2');
+          const captured = vi.fn();
+          second.provider.on('session:providerSessionReceived', captured);
+          second.provider.setProviderSessionData('session-restart', { providerSessionId: persistedThreadId });
+          await second.turn(secondModel, undefined, 'session-restart');
+          return { second, captured, persistedThreadId };
+        }
+
+        it.each([
+          ['deepseek-flash', 'gpt-6-luna'],
+          ['gpt-6-luna', 'deepseek-flash'],
+          ['deepseek-flash', 'Qwen3-Coder-30B-A3B-Instruct-ovh'],
+          ['Qwen3-Coder-30B-A3B-Instruct-ovh', 'gpt-6-sol'],
+        ])('never resumes a %s thread as %s', async (firstModel, secondModel) => {
+          vi.stubEnv('NIMBALYST_CODEX_ROUTE_DEBUG', '1');
+          const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+          const { second, captured } = await restartWith(firstModel, secondModel);
+          vi.unstubAllEnvs();
+          expect(log).toHaveBeenCalledWith('[CODEX ROUTE] new-thread', expect.objectContaining({
+            reason: 'provider/profile boundary',
+            discardedThreadId: 'thread-p1-1',
+          }));
+          expect(second.resumeSession).not.toHaveBeenCalled();
+          expect(second.createSession).toHaveBeenCalledTimes(1);
+          expect(second.provider.getProviderSessionData('session-restart').providerSessionId).toBe('thread-p2-1');
+          expect(captured).toHaveBeenCalledWith({ sessionId: 'session-restart', providerSessionId: 'thread-p2-1' });
+
+          // The replacement thread is recorded under the new route, so a
+          // third process resumes it rather than starting yet another one.
+          const third = createProvider(profileDiscovery(), createFileCodexThreadRoutingStore(routingFile), 'thread-p3');
+          third.provider.setProviderSessionData('session-restart', { providerSessionId: 'thread-p2-1' });
+          await third.turn(secondModel, undefined, 'session-restart');
+          expect(third.createSession).not.toHaveBeenCalled();
+          expect(third.resumeSession).toHaveBeenCalledWith('thread-p2-1', expect.anything());
+        });
+
+        it('still resumes when provider and profile are unchanged', async () => {
+          const { second, persistedThreadId } = await restartWith('gpt-6-luna', 'gpt-6-sol');
+          expect(second.createSession).not.toHaveBeenCalled();
+          expect(second.resumeSession).toHaveBeenCalledWith(persistedThreadId, expect.anything());
+        });
       });
     });
 

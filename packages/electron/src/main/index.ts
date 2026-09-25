@@ -2610,6 +2610,7 @@ app.whenReady().then(async () => {
       const safeId = sessionId.replace(/[^A-Za-z0-9_-]/g, '_');
       return join(app.getPath('userData'), 'codex-pre-edit-snapshots', safeId);
     });
+    OpenAICodexProvider.setThreadRoutingFile(join(app.getPath('userData'), 'codex-thread-routing.json'));
 
     // Codex transport selection. Default to 'app-server' for new sessions
     // unless the user has explicitly opted into the legacy 'sdk' transport
