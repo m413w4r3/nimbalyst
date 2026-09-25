@@ -2634,11 +2634,12 @@ app.whenReady().then(async () => {
     // before the user completed the browser flow. We treat `account === null`
     // as the only valid "not signed in" signal -- `requiresOpenaiAuth` can be
     // true on signed-in-but-no-codex-access plans, which is a different state
-    // and should surface as a 401 mid-turn, not as a sign-in prompt.
+    // and should surface as a 401 mid-turn, not as a sign-in prompt. A custom
+    // `model_provider` in config.toml has no account and needs none.
     OpenAICodexProvider.setCodexAuthGate(async () => {
       try {
         const status = await codexAuthService.getStatus(true);
-        return { requiresOpenaiAuth: status.account === null };
+        return { requiresOpenaiAuth: OpenAICodexProvider.codexAccountRequiresSignIn(status) };
       } catch (err) {
         console.warn('[CODEX] codexAuthService.getStatus() failed in auth gate:', err);
         return { requiresOpenaiAuth: false };

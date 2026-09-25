@@ -29,6 +29,7 @@ import { capAppServerItemParamsForStorage } from '../../../storage/toolOutputBud
 import { ToolPermissionService } from '../permissions/ToolPermissionService';
 import { PermissionMode, TrustChecker, PermissionPatternSaver, PermissionPatternChecker, SecurityLogger } from './ProviderPermissionMixin';
 import { CodexSdkModuleLike, loadCodexSdkModule } from './codex/codexSdkLoader';
+import { parseCodexConfigModelIds, readCodexConfigToml } from './codex/codexConfigModels';
 import { resolvePackagedCodexBinaryPath } from './codex/codexBinaryPath';
 import { McpConfigService } from '../services/McpConfigService';
 import { getMcpConfigService, isInternalMcpServerEnabled, areTrackerToolsEnabled, resolveTrackersWorkspacePath } from '../services/mcpServerConfig';
@@ -83,6 +84,7 @@ interface OpenAICodexProviderDeps {
 
 interface OpenAICodexModelDiscoveryDeps {
   loadSdkModule?: () => Promise<CodexSdkModuleLike>;
+  readCodexConfig?: () => Promise<string | null>;
 }
 
 interface PendingAskUserQuestionEntry {
@@ -337,6 +339,15 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     OpenAICodexProvider.codexAuthGate = gate;
   }
 
+  /**
+   * Sign-in is required only when no account is loaded AND the configured
+   * model provider needs OpenAI auth. A custom `model_provider` from
+   * config.toml (e.g. DeepSeek) reports `account: null, requiresOpenaiAuth: false`.
+   */
+  public static codexAccountRequiresSignIn(status: { account: unknown; requiresOpenaiAuth: boolean }): boolean {
+    return status.account === null && status.requiresOpenaiAuth;
+  }
+
   constructor(config?: { apiKey?: string }, deps?: OpenAICodexProviderDeps) {
     super();
     const apiKey = config?.apiKey || '';
@@ -561,7 +572,34 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   ): Promise<AIModel[]> {
     const sdkModels = await OpenAICodexProvider.getModelsFromSdk(apiKey, deps);
     const apiModels = await OpenAICodexProvider.getModelsFromOpenAI(apiKey);
-    return OpenAICodexProvider.getPreferredModels(sdkModels, apiModels);
+    const preferred = OpenAICodexProvider.getPreferredModels(sdkModels, apiModels);
+    return OpenAICodexProvider.appendCodexConfigModels(preferred, deps);
+  }
+
+  /**
+   * Append models the user declared in Codex's config.toml that the curated
+   * catalog does not already cover -- the only way a custom `model_providers`
+   * model reaches the picker. The catalog filter still applies to SDK/API
+   * discovery; these ids come from the user's own Codex configuration.
+   */
+  private static async appendCodexConfigModels(
+    models: AIModel[],
+    deps?: OpenAICodexModelDiscoveryDeps,
+  ): Promise<AIModel[]> {
+    const toml = await (deps?.readCodexConfig ?? readCodexConfigToml)();
+    if (!toml) {
+      return models;
+    }
+    const seen = new Set(models.map((model) => OpenAICodexProvider.toRawModelId(model.id)));
+    const extra = OpenAICodexProvider.mapSdkModelResult(parseCodexConfigModelIds(toml)).filter((model) => {
+      const rawId = OpenAICodexProvider.toRawModelId(model.id);
+      if (seen.has(rawId)) {
+        return false;
+      }
+      seen.add(rawId);
+      return true;
+    });
+    return [...models, ...extra];
   }
 
   private static getFallbackModels() {

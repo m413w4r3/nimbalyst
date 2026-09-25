@@ -9,6 +9,7 @@ import { configureMcpServers } from '../../services/mcpServerConfig';
 import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
+import { buildCodexThreadStartParams } from '../../protocols/codexAppServer/threadConfiguration';
 
 // getModels() cross-checks the OpenAI model catalogue whenever it is given an
 // API key. Unmocked, that is a real api.openai.com request from the unit suite:
@@ -18,6 +19,13 @@ vi.mock('openai', () => ({
   default: class {
     models = { list: async () => ({ data: [] as Array<{ id: string }> }) };
   },
+}));
+
+// getModels() also reads the developer's real ~/.codex/config.toml; keep the
+// roster hermetic. Tests that exercise it inject `readCodexConfig`.
+vi.mock('../codex/codexConfigModels', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../codex/codexConfigModels')>()),
+  readCodexConfigToml: async () => null,
 }));
 
 function createAsyncEventStream(events: any[]): AsyncIterable<any> {
@@ -282,6 +290,41 @@ describe('OpenAICodexProvider', () => {
     expect(acpModels.map((model) => model.id)).toEqual(
       expectedAcpModelIds.map((modelId) => `openai-codex-acp:${modelId}`)
     );
+  });
+
+  it('appends custom-provider models from config.toml after the unchanged catalog', async () => {
+    const catalog = await OpenAICodexProvider.getModels(undefined, {
+      loadSdkModule: async () => {
+        throw new Error('sdk unavailable');
+      },
+    });
+    const models = await OpenAICodexProvider.getModels(undefined, {
+      loadSdkModule: async () => {
+        throw new Error('sdk unavailable');
+      },
+      readCodexConfig: async () => [
+        'model = "deepseek-flash" # default',
+        'model_provider = "deepseek"',
+        '[model_providers.deepseek]',
+        'model = "not-a-model"',
+        'experimental_bearer_token = "secret"',
+        '[profiles.pro]',
+        "model = 'deepseek-v4-pro'",
+        '[profiles.gpt]',
+        'model = "gpt-5.5"',
+      ].join('\n'),
+    });
+
+    expect(models.map((model) => model.id)).toEqual([
+      ...catalog.map((model) => model.id),
+      'openai-codex:deepseek-flash',
+      'openai-codex:deepseek-v4-pro',
+    ]);
+  });
+
+  it('leaves custom-provider model ids untouched when normalizing', () => {
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:deepseek-flash')).toBe('openai-codex:deepseek-flash');
+    expect(OpenAICodexProvider.normalizeModelSelection('deepseek-v4-pro')).toBe('deepseek-v4-pro');
   });
 
   it('normalizes legacy codex default aliases to the GPT-6 Sol default', () => {
@@ -2016,6 +2059,29 @@ describe('OpenAICodexProvider', () => {
       expect(gate).toHaveBeenCalledTimes(1);
       expect(chunks.some((c) => c.type === 'error' && c.isCodexAuthRequired)).toBe(false);
       expect(createSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends a custom-provider model to the app-server thread unchanged', async () => {
+      OpenAICodexProvider.setCodexAuthGate(async () => ({ requiresOpenaiAuth: false }));
+
+      const { provider, createSession } = buildAppServerProvider();
+      await provider.initialize({ model: 'openai-codex:deepseek-flash' });
+      for await (const _chunk of provider.sendMessage('hi', undefined, 'session-custom-model', [], process.cwd())) {
+        // drain
+      }
+
+      const threadParams = buildCodexThreadStartParams((createSession.mock.calls[0] as any[])[0]);
+      expect(threadParams.model).toBe('deepseek-flash');
+      // model_provider must come from the user's config.toml, never an override.
+      expect(threadParams.config).not.toHaveProperty('model_provider');
+    });
+
+    it('requires sign-in only when no account is loaded and the model provider needs OpenAI auth', () => {
+      expect(OpenAICodexProvider.codexAccountRequiresSignIn({ account: null, requiresOpenaiAuth: true })).toBe(true);
+      // Custom model_provider (e.g. DeepSeek) in config.toml.
+      expect(OpenAICodexProvider.codexAccountRequiresSignIn({ account: null, requiresOpenaiAuth: false })).toBe(false);
+      // Signed in without Codex access surfaces mid-turn, not as a sign-in prompt.
+      expect(OpenAICodexProvider.codexAccountRequiresSignIn({ account: { type: 'chatgpt' }, requiresOpenaiAuth: true })).toBe(false);
     });
 
     it('falls through on gate failure instead of blocking the turn', async () => {
